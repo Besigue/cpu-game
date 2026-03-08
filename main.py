@@ -1085,12 +1085,6 @@ async def api_join_room(req: Request):
         return JSONResponse({"error": "room_not_found"}, 400)
 
     room = ROOMS[rid]
-    if room.get("phase") != "waiting":
-        # ✅ Allow REJOIN mid-game ONLY if the name already belongs to this room.
-        # This supports browser refresh/back navigation without resetting the player to lobby.
-        existing_names = [p.get("name") for p in room.get("players", []) if p.get("name")]
-        if pn_req not in existing_names:
-            return JSONResponse({"error": "game_started"}, 400)
 
     room.setdefault("players", [])
     room.setdefault("scores", {})
@@ -1103,50 +1097,61 @@ async def api_join_room(req: Request):
 
     existing_names = [p.get("name") for p in room["players"] if p.get("name")]
 
-    if pn_req in existing_names:
-        room_sockets = ROOM_SOCKETS.get(rid, {})
-        active_socks = room_sockets.get(pn_req, []) or []
+    # Waiting-room rule:
+    # if a new player types a name that already exists in the room,
+    # assign a unique visible name like "PlayerName123".
+    # Do NOT treat that as a reconnect while the room is still waiting.
+    if room.get("phase") == "waiting":
+        if len(room["players"]) >= MAX_SEATS:
+            return JSONResponse({"error": "room_full"}, 400)
 
-        if active_socks:
-            room["ready_to_start"] = (len(room["players"]) >= MAX_SEATS)
-            await broadcast_state_without_hands(rid)
-            await broadcast_lobby_rooms()
-            return {
-                "joined": True,
-                "already_in_room": True,
-                "room_id": rid,
-                "player_name": pn_req,
-                "room_label": room["label"],
-                "room_host": room["host"]
-            }
+        pn = _unique_name_in_room(room, pn_req)
 
-        room["players"] = [p for p in room["players"] if p.get("name") != pn_req]
-        room["scores"].pop(pn_req, None)
-        room["melds"].pop(pn_req, None)
-        room.get("hands", {}).pop(pn_req, None) if isinstance(room.get("hands"), dict) else None
-        room["scored_melds"].pop(pn_req, None)
-        room["won_tricks"].pop(pn_req, None)
+        room["players"].append({"name": pn})
+        room["scores"][pn] = 0
+        room["melds"].setdefault(pn, [])
+        room["scored_melds"].setdefault(pn, [])
+        room["won_tricks"].setdefault(pn, [])
 
-    if len(room["players"]) >= MAX_SEATS:
-        return JSONResponse({"error": "room_full"}, 400)
+        room["ready_to_start"] = (len(room["players"]) >= MAX_SEATS)
 
-    pn = _unique_name_in_room(room, pn_req)
+        await broadcast_state_without_hands(rid)
+        await broadcast_lobby_rooms()
 
-    room["players"].append({"name": pn})
-    room["scores"][pn] = 0
-    room["melds"].setdefault(pn, [])
-    room["scored_melds"].setdefault(pn, [])
-    room["won_tricks"].setdefault(pn, [])
+        return {
+            "joined": True,
+            "room_id": rid,
+            "player_name": pn,
+            "room_label": room["label"],
+            "room_host": room["host"]
+        }
 
-    room["ready_to_start"] = (len(room["players"]) >= MAX_SEATS)
+    # Mid-game rule:
+    # only allow a true rejoin if the exact existing player name already belongs
+    # to this room. New joins after game start are blocked.
+    if pn_req not in existing_names:
+        return JSONResponse({"error": "game_started"}, 400)
 
-    await broadcast_state_without_hands(rid)
-    await broadcast_lobby_rooms()
+    room_sockets = ROOM_SOCKETS.get(rid, {})
+    active_socks = room_sockets.get(pn_req, []) or []
+
+    if active_socks:
+        room["ready_to_start"] = (len(room["players"]) >= MAX_SEATS)
+        await broadcast_state_without_hands(rid)
+        await broadcast_lobby_rooms()
+        return {
+            "joined": True,
+            "already_in_room": True,
+            "room_id": rid,
+            "player_name": pn_req,
+            "room_label": room["label"],
+            "room_host": room["host"]
+        }
 
     return {
         "joined": True,
         "room_id": rid,
-        "player_name": pn,
+        "player_name": pn_req,
         "room_label": room["label"],
         "room_host": room["host"]
     }
