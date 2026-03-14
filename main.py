@@ -22,6 +22,8 @@ import uuid
 import random
 import asyncio
 import logging
+import secrets
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional, Tuple
 
 log = logging.getLogger("besigue")
@@ -74,6 +76,9 @@ SUITS = ["hearts", "diamonds", "clubs", "spades"]
 
 MAX_SEATS = 4
 WINNING_SCORE = 400
+RECONNECT_GRACE_SECONDS = 30
+CPU_TAKEOVER_SLOW_PLAY_SECONDS = 30
+CPU_TAKEOVER_SLOW_WINDOW_SECONDS = 120
 
 NO_WINNER_TEXT = "No Winner Yet, Let's Keep Going!"
 
@@ -97,6 +102,14 @@ def _normalize_name(raw: Any) -> str:
     return pn
 
 
+def _ensure_player_reconnect_token(player: dict) -> str:
+    token = player.get("reconnect_token")
+    if not token or not isinstance(token, str):
+        token = make_reconnect_token()
+        player["reconnect_token"] = token
+    return token
+
+
 def _unique_name_in_room(room: dict, desired: str) -> str:
     desired = desired.strip()
     existing = set(p.get("name") for p in room.get("players", []) if p.get("name"))
@@ -109,6 +122,68 @@ def _unique_name_in_room(room: dict, desired: str) -> str:
             return candidate
 
     return f"{desired}{uuid.uuid4().hex[:4]}"
+
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def make_reconnect_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _seconds_left_from_iso(raw: Optional[str]) -> int:
+    if not raw:
+        return 0
+    try:
+        dt = datetime.fromisoformat(raw)
+        secs = int((dt - utc_now()).total_seconds())
+        return max(0, secs)
+    except Exception:
+        return 0
+
+
+def _ensure_player_runtime_meta(player: dict):
+    if player.get("is_cpu"):
+        player.setdefault("connection_state", "cpu_builtin")
+        player.setdefault("cpu_playing_for_name", None)
+        return
+    _ensure_player_reconnect_token(player)
+    player.setdefault("connection_state", "human_active")
+    player.setdefault("disconnect_at", None)
+    player.setdefault("reconnect_deadline", None)
+    player.setdefault("cpu_takeover_started_at", None)
+    player.setdefault("cpu_playing_for_name", None)
+
+
+def _set_player_connected(player: dict):
+    _ensure_player_runtime_meta(player)
+    player["connection_state"] = "human_active"
+    player["disconnect_at"] = None
+    player["reconnect_deadline"] = None
+    player["cpu_takeover_started_at"] = None
+    player["cpu_playing_for_name"] = None
+
+
+def _set_player_disconnected_reserved(player: dict):
+    _ensure_player_runtime_meta(player)
+    now = utc_now()
+    player["connection_state"] = "human_disconnected_reserved"
+    player["disconnect_at"] = now.isoformat()
+    player["reconnect_deadline"] = (now + timedelta(seconds=RECONNECT_GRACE_SECONDS)).isoformat()
+    player["cpu_takeover_started_at"] = None
+    player["cpu_playing_for_name"] = None
+
+
+def _set_player_cpu_takeover(player: dict):
+    _ensure_player_runtime_meta(player)
+    now = utc_now()
+    player["connection_state"] = "cpu_takeover_active"
+    player["cpu_takeover_started_at"] = now.isoformat()
+    player["cpu_playing_for_name"] = player.get("name")
+    player["disconnect_at"] = player.get("disconnect_at") or now.isoformat()
+    player["reconnect_deadline"] = None
 
 
 def canonical_card_with_uid(code: str):
@@ -883,6 +958,7 @@ async def broadcast_state_without_hands(room_id: str):
     if not room:
         return
     players = [p["name"] for p in room.get("players", [])]
+    player_statuses = _get_public_player_statuses(room)
 
     current_trick_codes = [t.get("card") for t in (room.get("current_trick", []) or []) if t.get("card")]
     current_trick_full = _build_public_trick_payload(room)
@@ -895,6 +971,7 @@ async def broadcast_state_without_hands(room_id: str):
     data = {
         "phase": room.get("phase"),
         "players": players,
+        "player_statuses": player_statuses,
         "deck_count": int(deck_count),
         "melds": room.get("melds", {}),
         "scores": room.get("scores", {}),
@@ -933,6 +1010,7 @@ async def send_state_update_to_player(room_id: str, player_name: str):
         return
 
     players = [p["name"] for p in room.get("players", [])]
+    player_statuses = _get_public_player_statuses(room)
     all_hands = room.get("hands", {})
     player_hand = all_hands.get(player_name, [])
 
@@ -946,6 +1024,7 @@ async def send_state_update_to_player(room_id: str, player_name: str):
     data = {
         "phase": room.get("phase"),
         "players": players,
+        "player_statuses": player_statuses,
         "deck_count": int(deck_count),
         "melds": room.get("melds", {}),
         "scores": room.get("scores", {}),
@@ -1015,7 +1094,7 @@ async def api_create_room(req: Request):
         "room_id": rid,
         "label": f"{pn}'s Room, 4 seats",
         "host": pn,
-        "players": [{"name": pn}],
+        "players": [{"name": pn, "is_cpu": False, "reconnect_token": make_reconnect_token(), "connection_state": "human_active", "disconnect_at": None, "reconnect_deadline": None, "cpu_takeover_started_at": None, "cpu_playing_for_name": None}],
         "phase": "waiting",
         "deck": [],
         "melds": {pn: []},
@@ -1041,6 +1120,7 @@ async def api_create_room(req: Request):
         "awaiting_next_round": False,
         "count_required": False,
         "count_done": False,
+        "_disconnect_tasks": {},
     }
 
     ROOMS[rid] = room
@@ -1048,11 +1128,14 @@ async def api_create_room(req: Request):
     ROOM_SOCKETS.setdefault(rid, {})
 
     await broadcast_lobby_rooms()
+    reconnect_token = _ensure_player_reconnect_token(room["players"][0])
+    log.info(f"[RECONNECT] create_room room={rid} player={pn} token_present={bool(reconnect_token)}")
     return {
         "room_id": rid,
         "room_label": room["label"],
         "player_name": pn,
-        "room_host": room["host"]
+        "room_host": room["host"],
+        "reconnect_token": reconnect_token
     }
 
 
@@ -1094,6 +1177,7 @@ async def api_join_room(req: Request):
     room.setdefault("awaiting_next_round", False)
     room.setdefault("count_required", False)
     room.setdefault("count_done", False)
+    room.setdefault("_disconnect_tasks", {})
 
     existing_names = [p.get("name") for p in room["players"] if p.get("name")]
 
@@ -1107,7 +1191,7 @@ async def api_join_room(req: Request):
 
         pn = _unique_name_in_room(room, pn_req)
 
-        room["players"].append({"name": pn})
+        room["players"].append({"name": pn, "is_cpu": False, "reconnect_token": make_reconnect_token(), "connection_state": "human_active", "disconnect_at": None, "reconnect_deadline": None, "cpu_takeover_started_at": None, "cpu_playing_for_name": None})
         room["scores"][pn] = 0
         room["melds"].setdefault(pn, [])
         room["scored_melds"].setdefault(pn, [])
@@ -1118,12 +1202,17 @@ async def api_join_room(req: Request):
         await broadcast_state_without_hands(rid)
         await broadcast_lobby_rooms()
 
+        player_obj = next((p for p in room.get("players", []) if p.get("name") == pn), None)
+        reconnect_token = _ensure_player_reconnect_token(player_obj) if player_obj else None
+        log.info(f"[RECONNECT] join_room(waiting) room={rid} player={pn} token_present={bool(reconnect_token)}")
+
         return {
             "joined": True,
             "room_id": rid,
             "player_name": pn,
             "room_label": room["label"],
-            "room_host": room["host"]
+            "room_host": room["host"],
+            "reconnect_token": reconnect_token
         }
 
     # Mid-game rule:
@@ -1139,27 +1228,75 @@ async def api_join_room(req: Request):
         room["ready_to_start"] = (len(room["players"]) >= MAX_SEATS)
         await broadcast_state_without_hands(rid)
         await broadcast_lobby_rooms()
+        player_obj = next((p for p in room.get("players", []) if p.get("name") == pn_req), None)
+        reconnect_token = _ensure_player_reconnect_token(player_obj) if player_obj else None
+        log.info(f"[RECONNECT] join_room(existing-active) room={rid} player={pn_req} token_present={bool(reconnect_token)}")
         return {
             "joined": True,
             "already_in_room": True,
             "room_id": rid,
             "player_name": pn_req,
             "room_label": room["label"],
-            "room_host": room["host"]
+            "room_host": room["host"],
+            "reconnect_token": reconnect_token
         }
 
+    player_obj = next((p for p in room.get("players", []) if p.get("name") == pn_req), None)
+    reconnect_token = _ensure_player_reconnect_token(player_obj) if player_obj else None
+    log.info(f"[RECONNECT] join_room(mid-game) room={rid} player={pn_req} token_present={bool(reconnect_token)}")
     return {
         "joined": True,
         "room_id": rid,
         "player_name": pn_req,
         "room_label": room["label"],
-        "room_host": room["host"]
+        "room_host": room["host"],
+        "reconnect_token": reconnect_token
     }
 
 
 # ---------------------------------------------------
 # LEAVE ROOM
 # ---------------------------------------------------
+
+@app.post("/api/reconnect_room")
+async def api_reconnect_room(req: Request):
+    b = await req.json()
+    rid = b.get("room_id")
+    token = b.get("reconnect_token")
+
+    if not rid or rid not in ROOMS:
+        return JSONResponse({"error": "room_not_found"}, 404)
+    if not token or not isinstance(token, str):
+        return JSONResponse({"error": "bad_reconnect_token"}, 400)
+
+    room = ROOMS[rid]
+    for p in room.get("players", []):
+        if p.get("is_cpu"):
+            continue
+        _ensure_player_runtime_meta(p)
+        if p.get("reconnect_token") != token:
+            continue
+
+        reconnect_token = _ensure_player_reconnect_token(p)
+        log.info(f"[RECONNECT] reconnect_room accepted room={rid} player={p.get('name')} token_present={bool(reconnect_token)}")
+
+        await _mark_player_connected(rid, p.get("name"))
+        await broadcast_state_without_hands(rid)
+        for pp in [x.get("name") for x in room.get("players", []) if x.get("name")]:
+            await send_state_update_to_player(rid, pp)
+
+        return {
+            "ok": True,
+            "room_id": rid,
+            "player_name": p.get("name"),
+            "room_label": room.get("label"),
+            "room_host": room.get("host"),
+            "reconnect_token": reconnect_token,
+        }
+
+    return JSONResponse({"error": "reconnect_not_allowed"}, 403)
+
+
 @app.post("/api/leave_room")
 async def api_leave_room(req: Request):
     b = await req.json()
@@ -1242,6 +1379,117 @@ def _get_player_obj(room: dict, name: str):
             return p
     return None
 
+
+def _get_public_player_statuses(room: dict) -> Dict[str, dict]:
+    out: Dict[str, dict] = {}
+    for p in room.get("players", []) or []:
+        _ensure_player_runtime_meta(p)
+        _ensure_player_reconnect_token(p)
+        state = p.get("connection_state")
+        item = {
+            "connection_state": state,
+            "cpu_playing_for_name": p.get("cpu_playing_for_name"),
+        }
+        if state == "human_disconnected_reserved":
+            item["reconnect_seconds_left"] = _seconds_left_from_iso(p.get("reconnect_deadline"))
+        out[p.get("name")] = item
+    return out
+
+
+async def _cancel_disconnect_task(room: dict, player_name: str):
+    room.setdefault("_disconnect_tasks", {})
+    task = room["_disconnect_tasks"].pop(player_name, None)
+    if task:
+        try:
+            task.cancel()
+        except Exception:
+            pass
+
+
+async def _schedule_disconnect_takeover(room_id: str, player_name: str):
+    room = ROOMS.get(room_id)
+    if not room:
+        return
+    room.setdefault("_disconnect_tasks", {})
+    await _cancel_disconnect_task(room, player_name)
+
+    async def _runner():
+        try:
+            await asyncio.sleep(RECONNECT_GRACE_SECONDS)
+            r = ROOMS.get(room_id)
+            if not r:
+                return
+            p = _get_player_obj(r, player_name)
+            if not p or p.get("is_cpu"):
+                return
+            remaining = ROOM_SOCKETS.get(room_id, {}).get(player_name, []) or []
+            if remaining:
+                return
+            if r.get("phase") == "waiting":
+                return
+            if p.get("connection_state") != "human_disconnected_reserved":
+                return
+
+            _set_player_cpu_takeover(p)
+            await broadcast_state_without_hands(room_id)
+            for pp in [x.get("name") for x in r.get("players", []) if x.get("name")]:
+                await send_state_update_to_player(room_id, pp)
+            await cpu_maybe_act(room_id)
+        except asyncio.CancelledError:
+            return
+        finally:
+            r2 = ROOMS.get(room_id)
+            if r2 is not None:
+                r2.setdefault("_disconnect_tasks", {}).pop(player_name, None)
+
+    room["_disconnect_tasks"][player_name] = asyncio.create_task(_runner())
+
+
+async def _mark_player_connected(room_id: str, player_name: str):
+    room = ROOMS.get(room_id)
+    if not room:
+        return
+    p = _get_player_obj(room, player_name)
+    if not p or p.get("is_cpu"):
+        return
+    _set_player_connected(p)
+    await _cancel_disconnect_task(room, player_name)
+
+
+async def _mark_player_disconnected(room_id: str, player_name: str):
+    room = ROOMS.get(room_id)
+    if not room:
+        return
+    p = _get_player_obj(room, player_name)
+    if not p or p.get("is_cpu"):
+        return
+    if room.get("phase") == "waiting":
+        return
+
+    _set_player_disconnected_reserved(p)
+    await broadcast_state_without_hands(room_id)
+    for pp in [x.get("name") for x in room.get("players", []) if x.get("name")]:
+        await send_state_update_to_player(room_id, pp)
+    await _schedule_disconnect_takeover(room_id, player_name)
+
+
+def _cpu_delay_for_player(player: dict) -> float:
+    _ensure_player_runtime_meta(player)
+    if player.get("connection_state") != "cpu_takeover_active":
+        return 0.0
+    started_raw = player.get("cpu_takeover_started_at")
+    try:
+        started = datetime.fromisoformat(started_raw) if started_raw else None
+    except Exception:
+        started = None
+    if started is None:
+        return 0.0
+    elapsed = (utc_now() - started).total_seconds()
+    if elapsed < CPU_TAKEOVER_SLOW_WINDOW_SECONDS:
+        return float(CPU_TAKEOVER_SLOW_PLAY_SECONDS)
+    return 0.0
+
+
 def _is_cpu(room_or_name, maybe_name=None):
     """Return True if the given player is a CPU.
 
@@ -1258,7 +1506,8 @@ def _is_cpu(room_or_name, maybe_name=None):
     try:
         pobj = _get_player_obj(room, name)
         if pobj is not None:
-            return bool(pobj.get("is_cpu"))
+            _ensure_player_runtime_meta(pobj)
+            return bool(pobj.get("is_cpu")) or pobj.get("connection_state") == "cpu_takeover_active"
     except Exception:
         pass
     return isinstance(name, str) and name.startswith("CPU")
@@ -1273,7 +1522,7 @@ def _cpu_fill_room_to_four(room: dict):
         cpu_idx += 1
         if cpu_name in existing_names:
             continue
-        room['players'].append({'name': cpu_name, 'is_cpu': True, 'controller': 'cpu'})
+        room['players'].append({'name': cpu_name, 'is_cpu': True, 'controller': 'cpu', 'connection_state': 'cpu_builtin', 'cpu_playing_for_name': None})
         existing_names.append(cpu_name)
 
 def _rank_value(code: str) -> int:
@@ -1347,14 +1596,23 @@ async def cpu_maybe_act(room_id: str):
                 # CPU ACTION CHOICE
                 # ------------------------------------------------------------
                 # Phase 3 begins with a mandatory "pickup_melds" action by the leader.
+                cur_player = _get_player_obj(r2, cur) or {}
+                takeover_delay = _cpu_delay_for_player(cur_player)
+
                 if phase == "phase3" and not r2.get("phase3_melds_picked"):
                     # CPU_PHASE3_PICKUP_DELAY: give humans time to see melds before pickup
-                    await asyncio.sleep(6.0)
+                    await asyncio.sleep(max(6.0, takeover_delay))
+                    r_check = ROOMS.get(room_id) or {}
+                    if not _is_cpu(r_check, cur):
+                        break
                     await process_action(_DUMMY_WS, room_id, cur, {"action": "pickup_melds"})
 
                 elif r2.get("post_trick_draws"):
                     # CPU_DRAW_DELAY_POST_TRICK: give humans time to see the completed trick
-                    await asyncio.sleep(2.5)
+                    await asyncio.sleep(max(2.5, takeover_delay))
+                    r_check = ROOMS.get(room_id) or {}
+                    if not _is_cpu(r_check, cur):
+                        break
                     await process_action(_DUMMY_WS, room_id, cur, {"action": "draw_card"})
 
                 else:
@@ -1371,6 +1629,14 @@ async def cpu_maybe_act(room_id: str):
                         uid = (c or {}).get("uid")
                         if not uid:
                             continue
+                        r_check = ROOMS.get(room_id) or {}
+                        if not _is_cpu(r_check, cur):
+                            break
+                        if takeover_delay > 0:
+                            await asyncio.sleep(takeover_delay)
+                            r_check = ROOMS.get(room_id) or {}
+                            if not _is_cpu(r_check, cur):
+                                break
                         await process_action(_DUMMY_WS, room_id, cur, {"action": "play_card", "card": {"uid": uid}})
 
                         r_after = ROOMS.get(room_id) or {}
@@ -2616,18 +2882,23 @@ async def websocket_endpoint(
         return
 
     if not name_exists:
-        room["players"].append({"name": player_name})
+        room["players"].append({"name": player_name, "is_cpu": False, "reconnect_token": make_reconnect_token(), "connection_state": "human_active", "disconnect_at": None, "reconnect_deadline": None, "cpu_takeover_started_at": None, "cpu_playing_for_name": None})
         room["scores"].setdefault(player_name, 0)
         room["melds"].setdefault(player_name, [])
         room["scored_melds"].setdefault(player_name, [])
         room["won_tricks"].setdefault(player_name, [])
+
+    for p in room.get("players", []) or []:
+        _ensure_player_runtime_meta(p)
 
     room.setdefault("meld_scored_this_trick", False)
     room.setdefault("phase3_melds_picked", False)
     room.setdefault("pending_trick_clear", False)
     room.setdefault("ready_to_start", len(room.get("players", [])) >= MAX_SEATS)
 
+    await _mark_player_connected(room_id, player_name)
     await _register_single_socket(room_id, player_name, ws)
+    await broadcast_state_without_hands(room_id)
     await send_state_update_to_player(room_id, player_name)
 
     try:
@@ -2660,6 +2931,10 @@ async def websocket_endpoint(
                         await broadcast_state_without_hands(room_id)
 
                     await broadcast_lobby_rooms()
+            elif room:
+                remaining = ROOM_SOCKETS.get(room_id, {}).get(player_name, []) or []
+                if not remaining:
+                    await _mark_player_disconnected(room_id, player_name)
         except:
             pass
 
@@ -2689,6 +2964,10 @@ async def websocket_endpoint(
                         await broadcast_state_without_hands(room_id)
 
                     await broadcast_lobby_rooms()
+            elif room:
+                remaining = ROOM_SOCKETS.get(room_id, {}).get(player_name, []) or []
+                if not remaining:
+                    await _mark_player_disconnected(room_id, player_name)
         except:
             pass
 
