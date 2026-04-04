@@ -1,5 +1,5 @@
 # ============================
-# main.py — Besigue Server (v77.9-CPU-TEST)
+# main.py — Besigue Server (v77.9b-CPU-GAME-LIVE-CONVERT)
 #
 # Based on your pasted v76.8 (NO rewrites / no new files).
 #
