@@ -1,5 +1,5 @@
 # ============================
-# main.py — Besigue Server (v77.9b-CPU-GAME-LIVE-CONVERT)
+# main.py — Besigue Server (v81.0-CPU-TEST-PRACTICE-USES-STARTCPU-PATH)
 #
 # Based on your pasted v76.8 (NO rewrites / no new files).
 #
@@ -22,12 +22,13 @@ import uuid
 import random
 import asyncio
 import logging
-import secrets
-from datetime import datetime, timedelta, timezone
+import time
 from typing import Dict, List, Any, Optional, Tuple
+from itertools import combinations
 
 log = logging.getLogger("besigue")
 logging.basicConfig(level=logging.INFO)
+log.info("BOOT main.py v81.0 PRACTICE_USES_STARTCPU_PATH loaded")
 
 app = FastAPI()
 
@@ -76,11 +77,14 @@ SUITS = ["hearts", "diamonds", "clubs", "spades"]
 
 MAX_SEATS = 4
 WINNING_SCORE = 400
-RECONNECT_GRACE_SECONDS = 30
-CPU_TAKEOVER_SLOW_PLAY_SECONDS = 30
-CPU_TAKEOVER_SLOW_WINDOW_SECONDS = 120
+FINAL_TRICK_ROUND_END_DELAY = 3.0
+POST_SCORE_SHOWWINNER_DELAY = 2.5
+FINAL_TRICK_ROUND_END_DELAY_SAFE = globals().get("FINAL_TRICK_ROUND_END_DELAY", 3.0)
+ORDERED_TEST_DECK_ENABLED = False  # ordered test deck disabled after quinte verification
 
 NO_WINNER_TEXT = "No Winner Yet, Let's Keep Going!"
+PRACTICE_ROOM_PUBLIC_ID = "practice_room_1"
+PRACTICE_ROOM_PUBLIC_LABEL = "Practice Room 1, 1 seat"
 
 # Actions that should be blocked once game_over
 GAMEPLAY_ACTIONS = (
@@ -102,14 +106,6 @@ def _normalize_name(raw: Any) -> str:
     return pn
 
 
-def _ensure_player_reconnect_token(player: dict) -> str:
-    token = player.get("reconnect_token")
-    if not token or not isinstance(token, str):
-        token = make_reconnect_token()
-        player["reconnect_token"] = token
-    return token
-
-
 def _unique_name_in_room(room: dict, desired: str) -> str:
     desired = desired.strip()
     existing = set(p.get("name") for p in room.get("players", []) if p.get("name"))
@@ -122,68 +118,6 @@ def _unique_name_in_room(room: dict, desired: str) -> str:
             return candidate
 
     return f"{desired}{uuid.uuid4().hex[:4]}"
-
-
-
-def utc_now():
-    return datetime.now(timezone.utc)
-
-
-def make_reconnect_token() -> str:
-    return secrets.token_urlsafe(32)
-
-
-def _seconds_left_from_iso(raw: Optional[str]) -> int:
-    if not raw:
-        return 0
-    try:
-        dt = datetime.fromisoformat(raw)
-        secs = int((dt - utc_now()).total_seconds())
-        return max(0, secs)
-    except Exception:
-        return 0
-
-
-def _ensure_player_runtime_meta(player: dict):
-    if player.get("is_cpu"):
-        player.setdefault("connection_state", "cpu_builtin")
-        player.setdefault("cpu_playing_for_name", None)
-        return
-    _ensure_player_reconnect_token(player)
-    player.setdefault("connection_state", "human_active")
-    player.setdefault("disconnect_at", None)
-    player.setdefault("reconnect_deadline", None)
-    player.setdefault("cpu_takeover_started_at", None)
-    player.setdefault("cpu_playing_for_name", None)
-
-
-def _set_player_connected(player: dict):
-    _ensure_player_runtime_meta(player)
-    player["connection_state"] = "human_active"
-    player["disconnect_at"] = None
-    player["reconnect_deadline"] = None
-    player["cpu_takeover_started_at"] = None
-    player["cpu_playing_for_name"] = None
-
-
-def _set_player_disconnected_reserved(player: dict):
-    _ensure_player_runtime_meta(player)
-    now = utc_now()
-    player["connection_state"] = "human_disconnected_reserved"
-    player["disconnect_at"] = now.isoformat()
-    player["reconnect_deadline"] = (now + timedelta(seconds=RECONNECT_GRACE_SECONDS)).isoformat()
-    player["cpu_takeover_started_at"] = None
-    player["cpu_playing_for_name"] = None
-
-
-def _set_player_cpu_takeover(player: dict):
-    _ensure_player_runtime_meta(player)
-    now = utc_now()
-    player["connection_state"] = "cpu_takeover_active"
-    player["cpu_takeover_started_at"] = now.isoformat()
-    player["cpu_playing_for_name"] = player.get("name")
-    player["disconnect_at"] = player.get("disconnect_at") or now.isoformat()
-    player["reconnect_deadline"] = None
 
 
 def canonical_card_with_uid(code: str):
@@ -207,6 +141,45 @@ def new_deck_full_132():
     base += ["joker_red", "joker_red", "joker_black", "joker_black"]
     random.shuffle(base)
     return base
+
+
+
+def _apply_ordered_test_deck_for_host(room: dict, deck: List[str]) -> List[str]:
+    """
+    Temporary test helper:
+    Force the HOST to start with two marriages in spades plus A/J/10 of spades
+    so quinte can be tested deliberately.
+
+    Host opening 9 cards become:
+      Ks, Qs, Ks, Qs, As, Js, 10s, Ac, Ah
+
+    The rest of the deck stays in shuffled order with those exact copies removed.
+    """
+    if not ORDERED_TEST_DECK_ENABLED:
+        return deck
+
+    desired_prefix = [
+        "king_of_spades",
+        "queen_of_spades",
+        "king_of_spades",
+        "queen_of_spades",
+        "ace_of_spades",
+        "jack_of_spades",
+        "10_of_spades",
+        "ace_of_clubs",
+        "ace_of_hearts",
+    ]
+
+    working = list(deck)
+    prefix = []
+    for code in desired_prefix:
+        try:
+            idx = working.index(code)
+        except ValueError:
+            return deck
+        prefix.append(working.pop(idx))
+
+    return prefix + working
 
 
 def _safe_remove_ws(room_id: str, player_name: str, ws: WebSocket):
@@ -295,7 +268,7 @@ async def _emit_deck_count(room_id: str, deck_count: int):
     Helps force drawPile to update, including to 0.png when deck_count hits 0.
     """
     try:
-        await _send_to_player(room_id, player, {"type": "deck_count", "deck_count": int(deck_count)})
+        await _send_to_room(room_id, {"type": "deck_count", "deck_count": int(deck_count)})
     except:
         pass
 
@@ -366,51 +339,110 @@ def phase3_legal_uids_for_player(room: dict, player: str) -> set:
         return set()
 
     trick = room.get("current_trick", []) or []
-    trump = room.get("trump_suit") or ""
+    trump = (room.get("trump_suit") or "").strip().lower()
 
     if len(trick) == 0:
-        return set(c["uid"] for c in hand)
+        return set(c["uid"] for c in hand if c.get("uid"))
 
-    lead_card = trick[0]["card"]
-    lead_suit = suit_of(lead_card)
-
-    best_lead_rank = -999
-    for t in trick:
-        if lead_suit and suit_of(t["card"]) == lead_suit:
-            best_lead_rank = max(best_lead_rank, rank_of(t["card"]))
+    lead_card = trick[0].get("card") or ""
+    lead_is_joker = str(lead_card).startswith("joker")
+    lead_suit = (suit_of(lead_card) or "").strip().lower()
 
     any_trump_played = False
     best_trump_rank = -999
+    best_lead_rank = -999
+
     for t in trick:
-        if trump and suit_of(t["card"]) == trump and not t["card"].startswith("joker"):
+        card_code = t.get("card") or ""
+        if not card_code or str(card_code).startswith("joker"):
+            continue
+
+        s = (suit_of(card_code) or "").strip().lower()
+        rv = rank_of(card_code)
+
+        if lead_suit and s == lead_suit:
+            best_lead_rank = max(best_lead_rank, rv)
+
+        if trump and s == trump:
             any_trump_played = True
-            best_trump_rank = max(best_trump_rank, rank_of(t["card"]))
+            best_trump_rank = max(best_trump_rank, rv)
 
     lead_suit_cards = [
         c for c in hand
-        if lead_suit and suit_of(c["code"]) == lead_suit and not c["code"].startswith("joker")
+        if lead_suit and (suit_of(c.get("code", "")) or "").strip().lower() == lead_suit
+        and not str(c.get("code", "")).startswith("joker")
     ]
+
     trump_cards = [
         c for c in hand
-        if trump and suit_of(c["code"]) == trump and not c["code"].startswith("joker")
+        if trump and (suit_of(c.get("code", "")) or "").strip().lower() == trump
+        and not str(c.get("code", "")).startswith("joker")
     ]
 
-    if lead_suit_cards:
-        higher = [c for c in lead_suit_cards if rank_of(c["code"]) > best_lead_rank]
-        if higher:
-            return set(c["uid"] for c in higher)
-        return set(c["uid"] for c in lead_suit_cards)
+    legal = set()
 
+    # Joker-led trick in Phase 3:
+    # must play trump if possible; overtrump if possible; otherwise any card.
+    if lead_is_joker:
+        if trump_cards:
+            if any_trump_played:
+                over = [c for c in trump_cards if rank_of(c.get("code", "")) > best_trump_rank]
+                legal = set(c.get("uid") for c in (over or trump_cards) if c.get("uid"))
+            else:
+                legal = set(c.get("uid") for c in trump_cards if c.get("uid"))
+        else:
+            legal = set(c.get("uid") for c in hand if c.get("uid"))
+
+        if not legal:
+            log.error(f"[PHASE3 LEGAL EMPTY] joker_lead player={player} hand={[c.get('code') for c in hand]} trump={trump!r} trick={[t.get('card') for t in trick]}")
+            return set(c.get("uid") for c in hand if c.get("uid"))
+        return legal
+
+    # MUST FOLLOW LEAD SUIT if possible.
+    if lead_suit_cards:
+        # If lead suit itself is trump, the trump rule applies.
+        if trump and lead_suit == trump:
+            over = [c for c in lead_suit_cards if rank_of(c.get("code", "")) > best_trump_rank]
+            legal = set(c.get("uid") for c in (over or lead_suit_cards) if c.get("uid"))
+            if not legal:
+                log.error(f"[PHASE3 LEGAL EMPTY] lead_is_trump player={player} hand={[c.get('code') for c in hand]} trump={trump!r} trick={[t.get('card') for t in trick]}")
+                return set(c.get("uid") for c in hand if c.get("uid"))
+            return legal
+
+        # If a trump is already winning, any lead-suit card is legal.
+        if any_trump_played:
+            legal = set(c.get("uid") for c in lead_suit_cards if c.get("uid"))
+            if not legal:
+                log.error(f"[PHASE3 LEGAL EMPTY] trump_already_winning player={player} hand={[c.get('code') for c in hand]} trump={trump!r} trick={[t.get('card') for t in trick]}")
+                return set(c.get("uid") for c in hand if c.get("uid"))
+            return legal
+
+        # Otherwise must beat current winning lead-suit card if possible.
+        over_lead = [c for c in lead_suit_cards if rank_of(c.get("code", "")) > best_lead_rank]
+        legal = set(c.get("uid") for c in (over_lead or lead_suit_cards) if c.get("uid"))
+        if not legal:
+            log.error(f"[PHASE3 LEGAL EMPTY] follow_lead player={player} hand={[c.get('code') for c in hand]} trump={trump!r} trick={[t.get('card') for t in trick]}")
+            return set(c.get("uid") for c in hand if c.get("uid"))
+        return legal
+
+    # NO LEAD SUIT -> MUST TRUMP / OVERTRUMP IF POSSIBLE
     if trump_cards:
         if any_trump_played:
-            over = [c for c in trump_cards if rank_of(c["code"]) > best_trump_rank]
-            if over:
-                return set(c["uid"] for c in over)
-        return set(c["uid"] for c in trump_cards)
+            over = [c for c in trump_cards if rank_of(c.get("code", "")) > best_trump_rank]
+            legal = set(c.get("uid") for c in (over or trump_cards) if c.get("uid"))
+        else:
+            legal = set(c.get("uid") for c in trump_cards if c.get("uid"))
 
-    return set(c["uid"] for c in hand)
+        if not legal:
+            log.error(f"[PHASE3 LEGAL EMPTY] must_trump player={player} hand={[c.get('code') for c in hand]} trump={trump!r} trick={[t.get('card') for t in trick]}")
+            return set(c.get("uid") for c in hand if c.get("uid"))
+        return legal
 
-
+    # OTHERWISE ANY CARD
+    legal = set(c.get("uid") for c in hand if c.get("uid"))
+    if not legal:
+        log.error(f"[PHASE3 LEGAL EMPTY] fallback_any player={player} hand={[c.get('code') for c in hand]} trump={trump!r} trick={[t.get('card') for t in trick]}")
+    return legal
 def phase3_determine_winner(room: dict) -> str:
     trick = room.get("current_trick", []) or []
     if not trick:
@@ -455,6 +487,16 @@ def _players_order(room: dict) -> List[str]:
     return [p["name"] for p in room.get("players", [])]
 
 
+def _next_player_ccw(room: dict, current_player: str) -> str:
+    order = _players_order(room)
+    if not order:
+        return current_player or ""
+    if current_player not in order:
+        return order[0]
+    idx = order.index(current_player)
+    return order[(idx + 1) % len(order)]
+
+
 def _count_total_cards_for_player(room: dict, player: str) -> int:
     return len(room.get("hands", {}).get(player, []) or []) + len(room.get("melds", {}).get(player, []) or [])
 
@@ -493,6 +535,24 @@ def _remove_specific_card_uid(card_list, uid):
                 return False
             return True
     return False
+
+def _append_card_to_meld_unique(meld_list: list, card_obj: dict) -> bool:
+    """Append card to meld area only if this physical UID is not already present.
+
+    This preserves the game rule that a card may be reused across different meld
+    categories later, while preventing duplicate storage of the same physical card
+    in the visible meld area. Safe for normal CPU seats and CPU takeover seats.
+    """
+    if not isinstance(meld_list, list) or not isinstance(card_obj, dict):
+        return False
+    uid = card_obj.get("uid")
+    if not uid:
+        return False
+    for c in meld_list:
+        if isinstance(c, dict) and c.get("uid") == uid:
+            return False
+    meld_list.append(card_obj)
+    return True
 
 def _remove_last_remaining_card(room: dict, player: str) -> Optional[dict]:
     """
@@ -658,6 +718,8 @@ async def _end_game_now(room_id: str, room: dict, winner_code: str, text: str, b
     room["draw_index"] = 0
     room["current_turn"] = None
 
+    await asyncio.sleep(POST_SCORE_SHOWWINNER_DELAY)
+
     await _send_to_room(room_id, {
         "type": "show_winner",
         "winner": winner_code,
@@ -763,6 +825,7 @@ async def enter_phase3_if_ready(room_id: str):
     room["draw_index"] = 0
 
     room["current_trick"] = []
+    room["last_completed_trick"] = []
     room["pending_trick_clear"] = False
 
     lead = room.get("last_trick_winner")
@@ -952,13 +1015,27 @@ def _build_public_trick_payload(room: dict) -> List[dict]:
         })
     return payload
 
+def _build_last_completed_trick_payload(room: dict) -> List[dict]:
+    trick = room.get("last_completed_trick", []) or []
+    payload = []
+    for i, t in enumerate(trick[:4]):
+        card_code = (t.get("card") if isinstance(t, dict) else "") or ""
+        if not isinstance(card_code, str):
+            card_code = ""
+        payload.append({
+            "player": t.get("player") if isinstance(t, dict) else "",
+            "card": {"code": card_code, "uid": (t.get("uid") if isinstance(t, dict) else None)},
+            "image": card_image_url_for_code(card_code) if card_code else "",
+            "play_index": i
+        })
+    return payload
+
 
 async def broadcast_state_without_hands(room_id: str):
     room = ROOMS.get(room_id)
     if not room:
         return
     players = [p["name"] for p in room.get("players", [])]
-    player_statuses = _get_public_player_statuses(room)
 
     current_trick_codes = [t.get("card") for t in (room.get("current_trick", []) or []) if t.get("card")]
     current_trick_full = _build_public_trick_payload(room)
@@ -971,7 +1048,6 @@ async def broadcast_state_without_hands(room_id: str):
     data = {
         "phase": room.get("phase"),
         "players": players,
-        "player_statuses": player_statuses,
         "deck_count": int(deck_count),
         "melds": room.get("melds", {}),
         "scores": room.get("scores", {}),
@@ -991,6 +1067,7 @@ async def broadcast_state_without_hands(room_id: str):
 
         "current_trick_codes": current_trick_codes,
         "current_trick": current_trick_full,
+        "last_completed_trick": _build_last_completed_trick_payload(room),
 
         "pending_trick_clear": room.get("pending_trick_clear", False),
         "awaiting_next_round": room.get("awaiting_next_round", False),
@@ -1010,7 +1087,6 @@ async def send_state_update_to_player(room_id: str, player_name: str):
         return
 
     players = [p["name"] for p in room.get("players", [])]
-    player_statuses = _get_public_player_statuses(room)
     all_hands = room.get("hands", {})
     player_hand = all_hands.get(player_name, [])
 
@@ -1024,7 +1100,6 @@ async def send_state_update_to_player(room_id: str, player_name: str):
     data = {
         "phase": room.get("phase"),
         "players": players,
-        "player_statuses": player_statuses,
         "deck_count": int(deck_count),
         "melds": room.get("melds", {}),
         "scores": room.get("scores", {}),
@@ -1044,6 +1119,7 @@ async def send_state_update_to_player(room_id: str, player_name: str):
 
         "current_trick_codes": current_trick_codes,
         "current_trick": current_trick_full,
+        "last_completed_trick": _build_last_completed_trick_payload(room),
 
         "pending_trick_clear": room.get("pending_trick_clear", False),
         "awaiting_next_round": room.get("awaiting_next_round", False),
@@ -1053,6 +1129,13 @@ async def send_state_update_to_player(room_id: str, player_name: str):
 
         "hands": {player_name: player_hand},
     }
+
+    if room.get("awaiting_next_round"):
+        control_name = room.get("host") or "Host"
+        if player_name == control_name:
+            data["round_end_wait_text"] = "Click Count Aces & Tens" if room.get("count_required", False) else "Click Next Round"
+        else:
+            data["round_end_wait_text"] = f"Waiting for {control_name} to Count Aces & Tens" if room.get("count_required", False) else f"Waiting for {control_name} to continue the game"
 
     msg = {"type": "state_update", "data": data}
 
@@ -1094,13 +1177,14 @@ async def api_create_room(req: Request):
         "room_id": rid,
         "label": f"{pn}'s Room, 4 seats",
         "host": pn,
-        "players": [{"name": pn, "is_cpu": False, "reconnect_token": make_reconnect_token(), "connection_state": "human_active", "disconnect_at": None, "reconnect_deadline": None, "cpu_takeover_started_at": None, "cpu_playing_for_name": None}],
+        "players": [{"name": pn}],
         "phase": "waiting",
         "deck": [],
         "melds": {pn: []},
         "scores": {pn: 0},
         "ready_to_start": False,
         "current_trick": [],
+        "last_completed_trick": [],
         "pending_trick_clear": False,
         "current_turn": None,
         "marriage_pending": None,
@@ -1120,7 +1204,6 @@ async def api_create_room(req: Request):
         "awaiting_next_round": False,
         "count_required": False,
         "count_done": False,
-        "_disconnect_tasks": {},
     }
 
     ROOMS[rid] = room
@@ -1128,14 +1211,11 @@ async def api_create_room(req: Request):
     ROOM_SOCKETS.setdefault(rid, {})
 
     await broadcast_lobby_rooms()
-    reconnect_token = _ensure_player_reconnect_token(room["players"][0])
-    log.info(f"[RECONNECT] create_room room={rid} player={pn} token_present={bool(reconnect_token)}")
     return {
         "room_id": rid,
         "room_label": room["label"],
         "player_name": pn,
-        "room_host": room["host"],
-        "reconnect_token": reconnect_token
+        "room_host": room["host"]
     }
 
 
@@ -1144,7 +1224,11 @@ async def api_create_room(req: Request):
 # ---------------------------------------------------
 @app.get("/api/list_rooms")
 async def api_list_rooms():
-    rooms = []
+    rooms = [{
+        "room_id": PRACTICE_ROOM_PUBLIC_ID,
+        "label": PRACTICE_ROOM_PUBLIC_LABEL,
+        "players": 1
+    }]
     for r in ROOMS.values():
         if r.get("phase") == "waiting":
             rooms.append({
@@ -1155,6 +1239,57 @@ async def api_list_rooms():
     return {"rooms": rooms}
 
 
+def _create_started_practice_room_for_player(pn: str) -> dict:
+    rid = f"{pn}_Practice_Room"
+    counter = 1
+    while rid in ROOMS:
+        rid = f"{pn}_Practice_Room_{counter}"
+        counter += 1
+
+    room = {
+        "room_id": rid,
+        "label": f"{pn}'s Practice Room",
+        "host": pn,
+        "players": [
+            {"name": pn},
+            {"name": "CPU 1", "is_cpu": True, "controller": "cpu"},
+            {"name": "CPU 2", "is_cpu": True, "controller": "cpu"},
+            {"name": "CPU 3", "is_cpu": True, "controller": "cpu"},
+        ],
+        "phase": "lead_selection",
+        "deck": [],
+        "melds": {pn: [], "CPU 1": [], "CPU 2": [], "CPU 3": []},
+        "scores": {pn: 0, "CPU 1": 0, "CPU 2": 0, "CPU 3": 0},
+        "ready_to_start": True,
+        "current_trick": [],
+        "last_completed_trick": [],
+        "pending_trick_clear": False,
+        "current_turn": None,
+        "marriage_pending": None,
+        "temp_melds": {},
+        "post_trick_draws": False,
+        "draw_order": [],
+        "draw_index": 0,
+        "last_trick_winner": None,
+        "trump_suit": None,
+        "scored_melds": {pn: [], "CPU 1": [], "CPU 2": [], "CPU 3": []},
+        "meld_scored_this_trick": False,
+        "phase3_melds_picked": False,
+        "won_tricks": {pn: [], "CPU 1": [], "CPU 2": [], "CPU 3": []},
+        "_won_trick_sigs": set(),
+        "round_start_lead": None,
+        "awaiting_next_round": False,
+        "count_required": False,
+        "count_done": False,
+        "cpu_difficulty": 1,
+        "cpu_level": 1,
+    }
+    ROOMS[rid] = room
+    WS_CLIENTS.setdefault(rid, [])
+    ROOM_SOCKETS.setdefault(rid, {})
+    return room
+
+
 # ---------------------------------------------------
 # JOIN ROOM
 # ---------------------------------------------------
@@ -1163,6 +1298,25 @@ async def api_join_room(req: Request):
     b = await req.json()
     rid = b.get("room_id")
     pn_req = _normalize_name(b.get("player_name"))
+
+    if rid == PRACTICE_ROOM_PUBLIC_ID:
+        pn = pn_req
+        room = _create_started_practice_room_for_player(pn)
+
+        try:
+            await _start_cpu_style_game(room["room_id"], pn, cpu_level=2, cpu_scores_enabled=True)
+        except Exception as e:
+            log.exception(f"[PRACTICE START ERROR] room={room.get('room_id')} host={pn} err={e}")
+            return JSONResponse({"error": "practice_start_failed"}, 500)
+
+        return {
+            "joined": True,
+            "practice_room": True,
+            "room_id": room["room_id"],
+            "player_name": pn,
+            "room_label": room["label"],
+            "room_host": room["host"]
+        }
 
     if rid not in ROOMS:
         return JSONResponse({"error": "room_not_found"}, 400)
@@ -1177,21 +1331,16 @@ async def api_join_room(req: Request):
     room.setdefault("awaiting_next_round", False)
     room.setdefault("count_required", False)
     room.setdefault("count_done", False)
-    room.setdefault("_disconnect_tasks", {})
 
     existing_names = [p.get("name") for p in room["players"] if p.get("name")]
 
-    # Waiting-room rule:
-    # if a new player types a name that already exists in the room,
-    # assign a unique visible name like "PlayerName123".
-    # Do NOT treat that as a reconnect while the room is still waiting.
     if room.get("phase") == "waiting":
         if len(room["players"]) >= MAX_SEATS:
             return JSONResponse({"error": "room_full"}, 400)
 
         pn = _unique_name_in_room(room, pn_req)
 
-        room["players"].append({"name": pn, "is_cpu": False, "reconnect_token": make_reconnect_token(), "connection_state": "human_active", "disconnect_at": None, "reconnect_deadline": None, "cpu_takeover_started_at": None, "cpu_playing_for_name": None})
+        room["players"].append({"name": pn})
         room["scores"][pn] = 0
         room["melds"].setdefault(pn, [])
         room["scored_melds"].setdefault(pn, [])
@@ -1202,22 +1351,14 @@ async def api_join_room(req: Request):
         await broadcast_state_without_hands(rid)
         await broadcast_lobby_rooms()
 
-        player_obj = next((p for p in room.get("players", []) if p.get("name") == pn), None)
-        reconnect_token = _ensure_player_reconnect_token(player_obj) if player_obj else None
-        log.info(f"[RECONNECT] join_room(waiting) room={rid} player={pn} token_present={bool(reconnect_token)}")
-
         return {
             "joined": True,
             "room_id": rid,
             "player_name": pn,
             "room_label": room["label"],
-            "room_host": room["host"],
-            "reconnect_token": reconnect_token
+            "room_host": room["host"]
         }
 
-    # Mid-game rule:
-    # only allow a true rejoin if the exact existing player name already belongs
-    # to this room. New joins after game start are blocked.
     if pn_req not in existing_names:
         return JSONResponse({"error": "game_started"}, 400)
 
@@ -1228,75 +1369,27 @@ async def api_join_room(req: Request):
         room["ready_to_start"] = (len(room["players"]) >= MAX_SEATS)
         await broadcast_state_without_hands(rid)
         await broadcast_lobby_rooms()
-        player_obj = next((p for p in room.get("players", []) if p.get("name") == pn_req), None)
-        reconnect_token = _ensure_player_reconnect_token(player_obj) if player_obj else None
-        log.info(f"[RECONNECT] join_room(existing-active) room={rid} player={pn_req} token_present={bool(reconnect_token)}")
         return {
             "joined": True,
             "already_in_room": True,
             "room_id": rid,
             "player_name": pn_req,
             "room_label": room["label"],
-            "room_host": room["host"],
-            "reconnect_token": reconnect_token
+            "room_host": room["host"]
         }
 
-    player_obj = next((p for p in room.get("players", []) if p.get("name") == pn_req), None)
-    reconnect_token = _ensure_player_reconnect_token(player_obj) if player_obj else None
-    log.info(f"[RECONNECT] join_room(mid-game) room={rid} player={pn_req} token_present={bool(reconnect_token)}")
     return {
         "joined": True,
         "room_id": rid,
         "player_name": pn_req,
         "room_label": room["label"],
-        "room_host": room["host"],
-        "reconnect_token": reconnect_token
+        "room_host": room["host"]
     }
 
 
 # ---------------------------------------------------
 # LEAVE ROOM
 # ---------------------------------------------------
-
-@app.post("/api/reconnect_room")
-async def api_reconnect_room(req: Request):
-    b = await req.json()
-    rid = b.get("room_id")
-    token = b.get("reconnect_token")
-
-    if not rid or rid not in ROOMS:
-        return JSONResponse({"error": "room_not_found"}, 404)
-    if not token or not isinstance(token, str):
-        return JSONResponse({"error": "bad_reconnect_token"}, 400)
-
-    room = ROOMS[rid]
-    for p in room.get("players", []):
-        if p.get("is_cpu"):
-            continue
-        _ensure_player_runtime_meta(p)
-        if p.get("reconnect_token") != token:
-            continue
-
-        reconnect_token = _ensure_player_reconnect_token(p)
-        log.info(f"[RECONNECT] reconnect_room accepted room={rid} player={p.get('name')} token_present={bool(reconnect_token)}")
-
-        await _mark_player_connected(rid, p.get("name"))
-        await broadcast_state_without_hands(rid)
-        for pp in [x.get("name") for x in room.get("players", []) if x.get("name")]:
-            await send_state_update_to_player(rid, pp)
-
-        return {
-            "ok": True,
-            "room_id": rid,
-            "player_name": p.get("name"),
-            "room_label": room.get("label"),
-            "room_host": room.get("host"),
-            "reconnect_token": reconnect_token,
-        }
-
-    return JSONResponse({"error": "reconnect_not_allowed"}, 403)
-
-
 @app.post("/api/leave_room")
 async def api_leave_room(req: Request):
     b = await req.json()
@@ -1379,117 +1472,6 @@ def _get_player_obj(room: dict, name: str):
             return p
     return None
 
-
-def _get_public_player_statuses(room: dict) -> Dict[str, dict]:
-    out: Dict[str, dict] = {}
-    for p in room.get("players", []) or []:
-        _ensure_player_runtime_meta(p)
-        _ensure_player_reconnect_token(p)
-        state = p.get("connection_state")
-        item = {
-            "connection_state": state,
-            "cpu_playing_for_name": p.get("cpu_playing_for_name"),
-        }
-        if state == "human_disconnected_reserved":
-            item["reconnect_seconds_left"] = _seconds_left_from_iso(p.get("reconnect_deadline"))
-        out[p.get("name")] = item
-    return out
-
-
-async def _cancel_disconnect_task(room: dict, player_name: str):
-    room.setdefault("_disconnect_tasks", {})
-    task = room["_disconnect_tasks"].pop(player_name, None)
-    if task:
-        try:
-            task.cancel()
-        except Exception:
-            pass
-
-
-async def _schedule_disconnect_takeover(room_id: str, player_name: str):
-    room = ROOMS.get(room_id)
-    if not room:
-        return
-    room.setdefault("_disconnect_tasks", {})
-    await _cancel_disconnect_task(room, player_name)
-
-    async def _runner():
-        try:
-            await asyncio.sleep(RECONNECT_GRACE_SECONDS)
-            r = ROOMS.get(room_id)
-            if not r:
-                return
-            p = _get_player_obj(r, player_name)
-            if not p or p.get("is_cpu"):
-                return
-            remaining = ROOM_SOCKETS.get(room_id, {}).get(player_name, []) or []
-            if remaining:
-                return
-            if r.get("phase") == "waiting":
-                return
-            if p.get("connection_state") != "human_disconnected_reserved":
-                return
-
-            _set_player_cpu_takeover(p)
-            await broadcast_state_without_hands(room_id)
-            for pp in [x.get("name") for x in r.get("players", []) if x.get("name")]:
-                await send_state_update_to_player(room_id, pp)
-            await cpu_maybe_act(room_id)
-        except asyncio.CancelledError:
-            return
-        finally:
-            r2 = ROOMS.get(room_id)
-            if r2 is not None:
-                r2.setdefault("_disconnect_tasks", {}).pop(player_name, None)
-
-    room["_disconnect_tasks"][player_name] = asyncio.create_task(_runner())
-
-
-async def _mark_player_connected(room_id: str, player_name: str):
-    room = ROOMS.get(room_id)
-    if not room:
-        return
-    p = _get_player_obj(room, player_name)
-    if not p or p.get("is_cpu"):
-        return
-    _set_player_connected(p)
-    await _cancel_disconnect_task(room, player_name)
-
-
-async def _mark_player_disconnected(room_id: str, player_name: str):
-    room = ROOMS.get(room_id)
-    if not room:
-        return
-    p = _get_player_obj(room, player_name)
-    if not p or p.get("is_cpu"):
-        return
-    if room.get("phase") == "waiting":
-        return
-
-    _set_player_disconnected_reserved(p)
-    await broadcast_state_without_hands(room_id)
-    for pp in [x.get("name") for x in room.get("players", []) if x.get("name")]:
-        await send_state_update_to_player(room_id, pp)
-    await _schedule_disconnect_takeover(room_id, player_name)
-
-
-def _cpu_delay_for_player(player: dict) -> float:
-    _ensure_player_runtime_meta(player)
-    if player.get("connection_state") != "cpu_takeover_active":
-        return 0.0
-    started_raw = player.get("cpu_takeover_started_at")
-    try:
-        started = datetime.fromisoformat(started_raw) if started_raw else None
-    except Exception:
-        started = None
-    if started is None:
-        return 0.0
-    elapsed = (utc_now() - started).total_seconds()
-    if elapsed < CPU_TAKEOVER_SLOW_WINDOW_SECONDS:
-        return float(CPU_TAKEOVER_SLOW_PLAY_SECONDS)
-    return 0.0
-
-
 def _is_cpu(room_or_name, maybe_name=None):
     """Return True if the given player is a CPU.
 
@@ -1506,8 +1488,7 @@ def _is_cpu(room_or_name, maybe_name=None):
     try:
         pobj = _get_player_obj(room, name)
         if pobj is not None:
-            _ensure_player_runtime_meta(pobj)
-            return bool(pobj.get("is_cpu")) or pobj.get("connection_state") == "cpu_takeover_active"
+            return bool(pobj.get("is_cpu"))
     except Exception:
         pass
     return isinstance(name, str) and name.startswith("CPU")
@@ -1522,7 +1503,7 @@ def _cpu_fill_room_to_four(room: dict):
         cpu_idx += 1
         if cpu_name in existing_names:
             continue
-        room['players'].append({'name': cpu_name, 'is_cpu': True, 'controller': 'cpu', 'connection_state': 'cpu_builtin', 'cpu_playing_for_name': None})
+        room['players'].append({'name': cpu_name, 'is_cpu': True, 'controller': 'cpu'})
         existing_names.append(cpu_name)
 
 def _rank_value(code: str) -> int:
@@ -1540,6 +1521,389 @@ def _choose_cpu_play_uid(room: dict, cpu_name: str):
         return None
     hand_sorted = sorted(hand, key=lambda c: (_rank_value(c.get('code','')), c.get('code','')))
     return (hand_sorted[0] or {}).get('uid')
+
+def _cpu_room_level(room: dict) -> int:
+    try:
+        return int(room.get("cpu_difficulty", room.get("cpu_level", 1)) or 1)
+    except Exception:
+        return 1
+
+def _phase12_determine_winner_from_trick(trick: list, trump: str, phase: str) -> str:
+    if not trick:
+        return ""
+
+    lead = trick[0].get("card") or ""
+    lead_suit = lead.split("_of_")[1] if "_of_" in lead else ""
+
+    def suit_of_local(c: str):
+        return c.split("_of_")[1] if "_of_" in c else ""
+
+    def rank_of_local(c: str):
+        if not c or c.startswith("joker"):
+            return -99
+        r = c.split("_of_")[0] if "_of_" in c else ""
+        return rank_value_map.get(r, -1)
+
+    if lead.startswith("joker"):
+        if phase in ("phase2", "phase3") and trump:
+            trump_cards = [
+                t for t in trick
+                if not str(t.get("card", "")).startswith("joker")
+                and suit_of_local(t.get("card", "")) == trump
+            ]
+            if trump_cards:
+                best_rank = -999
+                winner = trump_cards[0].get("player", "")
+                for t in trump_cards:
+                    rv = rank_of_local(t.get("card", ""))
+                    if rv > best_rank:
+                        best_rank = rv
+                        winner = t.get("player", "")
+                return winner
+        return trick[0].get("player", "")
+
+    trump_cards = []
+    if trump:
+        trump_cards = [
+            t for t in trick
+            if not str(t.get("card", "")).startswith("joker")
+            and suit_of_local(t.get("card", "")) == trump
+        ]
+
+    if trump_cards:
+        best_rank = -999
+        winner = trump_cards[0].get("player", "")
+        for t in trump_cards:
+            rv = rank_of_local(t.get("card", ""))
+            if rv > best_rank:
+                best_rank = rv
+                winner = t.get("player", "")
+        return winner
+
+    suit_followers = [t for t in trick if suit_of_local(t.get("card", "")) == lead_suit]
+    if suit_followers:
+        best_rank = -999
+        winner = suit_followers[0].get("player", "")
+        for t in suit_followers:
+            rv = rank_of_local(t.get("card", ""))
+            if rv > best_rank:
+                best_rank = rv
+                winner = t.get("player", "")
+        return winner
+
+    return trick[0].get("player", "")
+
+def _cpu_card_wins_current_trick(room: dict, cpu_name: str, card: dict) -> bool:
+    try:
+        trick = list(room.get("current_trick", []) or [])
+        if not card or not card.get("code"):
+            return False
+        sim = trick + [{"player": cpu_name, "card": card.get("code"), "uid": card.get("uid")}]
+        winner = _phase12_determine_winner_from_trick(
+            sim,
+            room.get("trump_suit") or "",
+            (room.get("phase") or "").strip()
+        )
+        return winner == cpu_name
+    except Exception:
+        return False
+
+def _cpu_phase1_marriage_candidates(room: dict, player: str):
+    hand = room.get("hands", {}).get(player, []) or []
+    meld = room.get("melds", {}).get(player, []) or []
+
+    room.setdefault("scored_melds", {})
+    room["scored_melds"].setdefault(player, [])
+    used_in_marriage = set()
+    for rec in room["scored_melds"][player]:
+        if rec.get("category") == "marriage":
+            for u in rec.get("uids", []):
+                used_in_marriage.add(u)
+
+    candidate_cards = []
+    for c in hand + meld:
+        code = c.get("code", "")
+        uid = c.get("uid")
+        if not code or "_of_" not in code or not uid or uid in used_in_marriage:
+            continue
+        r, s = code.split("_of_")
+        if r in ("king", "queen"):
+            candidate_cards.append(c)
+
+    uid_source = {}
+    for c in hand:
+        uid_source[c["uid"]] = "hand"
+    for c in meld:
+        if c["uid"] not in uid_source:
+            uid_source[c["uid"]] = "meld"
+
+    by_suit = {}
+    for c in candidate_cards:
+        r, s = c["code"].split("_of_")
+        by_suit.setdefault(s, {"king": [], "queen": []})
+        by_suit[s][r].append(c)
+
+    out = []
+    for suit_name, g in by_suit.items():
+        if g["king"] and g["queen"]:
+            valid_pairs = []
+            for k in g["king"]:
+                for q in g["queen"]:
+                    if (uid_source.get(k["uid"]) == "hand" or uid_source.get(q["uid"]) == "hand"):
+                        valid_pairs.append((k, q))
+            if valid_pairs:
+                k, q = valid_pairs[0]
+                points = 40 if (room.get("trump_suit") is None or room.get("trump_suit") == suit_name) else 20
+                out.append({
+                    "type": "marriage",
+                    "points": points,
+                    "cards": [k, q],
+                    "suit": suit_name,
+                })
+    return out
+
+def _cpu_phase2_meld_candidates(room: dict, player: str):
+    hand = list(room.get("hands", {}).get(player, []) or [])
+    meld = list(room.get("melds", {}).get(player, []) or [])
+    trump = room.get("trump_suit") or ""
+    scored = room.get("scored_melds", {}).get(player, []) or []
+
+    used_by_category = build_used_uids_by_category(scored)
+
+    def eval_sel(selection):
+        if not selection:
+            return None
+
+        # Prevent duplicate physical card reuse inside one CPU-generated meld candidate.
+        # This does NOT block reusing the same card across DIFFERENT meld types later;
+        # it only blocks impossible duplicate use of the same UID within a single selection.
+        sel_uids = [c.get("uid") for c in selection if c.get("uid")]
+        if len(sel_uids) != len(selection) or len(set(sel_uids)) != len(sel_uids):
+            return None
+
+        if not any(((c.get("source") or "hand") == "hand") and (not str(c.get("code","")).startswith("joker")) for c in selection):
+            return None
+        if any(rank_of(c.get("code","")) in (0,1,2) for c in selection if not str(c.get("code","")).startswith("joker")):
+            return None
+
+        codes = [c.get("code","") for c in selection]
+
+        if len(selection) == 5:
+            nonj = [c for c in selection if not str(c.get("code","")).startswith("joker")]
+            if len(nonj) != 5:
+                return None
+            suits = {suit_of(c["code"]) for c in nonj}
+            if len(suits) != 1:
+                return None
+            suit_name = next(iter(suits))
+            if not trump or suit_name != trump:
+                return None
+            ranks = {c["code"].split("_of_")[0] for c in nonj}
+            if ranks != {"ace", "king", "queen", "jack", "10"}:
+                return None
+            king_from_meld = any(c["code"].startswith("king_of_") and (c.get("source") or "hand") == "meld" for c in selection)
+            queen_from_meld = any(c["code"].startswith("queen_of_") and (c.get("source") or "hand") == "meld" for c in selection)
+            if not king_from_meld or not queen_from_meld:
+                return None
+            return {"type": "quinte", "points": 250, "cards": selection}
+
+        if len(selection) == 4:
+            nonj = [c for c in selection if not str(c.get("code","")).startswith("joker")]
+            jokers = [c for c in selection if str(c.get("code","")).startswith("joker")]
+            if len(jokers) > 1 or len(nonj) < 3:
+                return None
+            rank0 = nonj[0]["code"].split("_of_")[0]
+            if rank0 not in ("ace", "king", "queen", "jack"):
+                return None
+            if any(c["code"].split("_of_")[0] != rank0 for c in nonj):
+                return None
+            used_fk = set()
+            for fk_cat in (
+                "four_aces", "four_kings", "four_queens", "four_jacks",
+                "three_aces_joker", "three_kings_joker",
+                "three_queens_joker", "three_jacks_joker",
+            ):
+                used_fk.update(used_by_category.get(fk_cat, set()))
+            if any(c.get("uid") in used_fk for c in selection):
+                return None
+            pts = 100 if rank0 == "ace" else 80 if rank0 == "king" else 60 if rank0 == "queen" else 40
+            return {"type": "four_kind", "points": pts, "cards": selection}
+
+        if len(selection) == 2:
+            have_qs = "queen_of_spades" in codes
+            have_jd = "jack_of_diamonds" in codes
+            if have_qs and have_jd:
+                used_b = used_by_category.get("besigue", set())
+                if any(c.get("uid") in used_b for c in selection):
+                    return None
+                return {"type": "besigue", "points": 40, "cards": selection}
+
+            a, b = selection[0], selection[1]
+            if str(a.get("code","")).startswith("joker") or str(b.get("code","")).startswith("joker"):
+                return None
+            used_m = used_by_category.get("marriage", set())
+            if a.get("uid") in used_m or b.get("uid") in used_m:
+                return None
+            ra, rb = a["code"].split("_of_")[0], b["code"].split("_of_")[0]
+            sa, sb = suit_of(a["code"]), suit_of(b["code"])
+            is_kq = ((ra == "king" and rb == "queen") or (ra == "queen" and rb == "king"))
+            if is_kq and sa and sa == sb:
+                pts = 40 if trump and sa == trump else 20
+                return {"type": "marriage", "points": pts, "cards": selection, "suit": sa}
+
+        return None
+
+    augmented_hand = [dict(c, source="hand") for c in hand]
+    augmented_meld = [dict(c, source="meld") for c in meld]
+
+    pool_raw = augmented_hand + augmented_meld
+
+    # Deduplicate by physical UID in case the same card appears
+    # in both hand and meld views during CPU candidate generation.
+    # This is safe for normal CPU seats and future CPU takeover seats,
+    # because it only affects temporary candidate evaluation, not stored state.
+    seen_pool_uids = set()
+    pool = []
+    for c in pool_raw:
+        uid = c.get("uid")
+        if not uid:
+            continue
+        if uid in seen_pool_uids:
+            continue
+        seen_pool_uids.add(uid)
+        pool.append(c)
+
+    out = []
+    seen = set()
+    for r in (2, 4, 5):
+        for combo in combinations(pool, r):
+            ev = eval_sel(list(combo))
+            if not ev:
+                continue
+            key = (ev["type"], tuple(sorted(c.get("uid") for c in ev["cards"] if c.get("uid"))))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(ev)
+    return out
+
+def _cpu_available_meld_candidates(room: dict, player: str):
+    phase = (room.get("phase") or "").strip()
+    out = []
+    if phase == "phase1":
+        out.extend(_cpu_phase1_marriage_candidates(room, player))
+    elif phase == "phase2":
+        out.extend(_cpu_phase2_meld_candidates(room, player))
+        out.extend(_cpu_phase1_marriage_candidates(room, player))
+    return out
+
+def _cpu_protected_uids_now(room: dict, player: str):
+    protected = set()
+    for cand in _cpu_available_meld_candidates(room, player):
+        for c in cand.get("cards", []) or []:
+            uid = c.get("uid")
+            if uid:
+                protected.add(uid)
+    return protected
+
+def _cpu_choose_play_uid_level2(room: dict, cpu_name: str):
+    hand = list(room.get("hands", {}).get(cpu_name, []) or [])
+    meld = list(room.get("melds", {}).get(cpu_name, []) or [])
+    combined = hand + meld
+    if not combined:
+        return None
+
+    phase = (room.get("phase") or "").strip()
+
+    if phase == "phase3":
+        legal_uids = phase3_legal_uids_for_player(room, cpu_name)
+        legal_cards = [c for c in combined if c.get("uid") in legal_uids] or combined[:]
+    else:
+        legal_cards = combined[:]
+
+    scoreable_now = bool(_cpu_available_meld_candidates(room, cpu_name)) if phase in ("phase1", "phase2") else False
+    if scoreable_now and room.get("current_trick"):
+        winning_cards = [c for c in legal_cards if _cpu_card_wins_current_trick(room, cpu_name, c)]
+        if winning_cards:
+            winning_cards = sorted(winning_cards, key=lambda c: (_rank_value(c.get("code","")), c.get("code","")))
+            return (winning_cards[0] or {}).get("uid")
+
+    protected = _cpu_protected_uids_now(room, cpu_name)
+    unprotected = [c for c in legal_cards if c.get("uid") not in protected]
+    candidates = unprotected if unprotected else legal_cards
+    candidates = sorted(candidates, key=lambda c: (_rank_value(c.get("code","")), c.get("code","")))
+    return (candidates[0] or {}).get("uid") if candidates else None
+
+async def _cpu_try_score_now(room_id: str, player_name: str) -> bool:
+    _cpu_score_t0 = time.monotonic()
+    room = ROOMS.get(room_id)
+    if not room:
+        return False
+    if room.get("phase") != "phase2":
+        return False
+    if room.get("current_turn") != player_name:
+        return False
+    if not room.get("post_trick_draws"):
+        return False
+    if room.get("meld_scored_this_trick"):
+        return False
+    if _cpu_room_level(room) < 2:
+        return False
+
+    try:
+        candidates = _cpu_available_meld_candidates(room, player_name)
+        log.info(f"[CPU SCORE CHECK] player={player_name} phase={room.get('phase')} candidates={len(candidates)}")
+        if not candidates:
+            log.info(f"[CPU SCORE END] room={room_id} player={player_name} result=no_candidates dt={time.monotonic() - _cpu_score_t0:.3f}s")
+            return False
+
+        type_priority = {"quinte": 4, "four_kind": 3, "besigue": 2, "marriage": 1}
+        candidates = sorted(
+            candidates,
+            key=lambda c: (
+                -int(c.get("points", 0) or 0),
+                -type_priority.get(c.get("type"), 0),
+                -sum(1 for x in (c.get("cards") or []) if (x.get("source") or "hand") == "hand"),
+                tuple(sorted(x.get("uid","") for x in (c.get("cards") or [])))
+            )
+        )
+
+        best = candidates[0]
+        cards = best.get("cards") or []
+        mtype = best.get("type")
+        log.info(f"[CPU SCORE ATTEMPT] player={player_name} meld_type={mtype} points={best.get('points')} cards={[c.get('code') for c in cards]}")
+
+        before_score = int((room.get("scores", {}) or {}).get(player_name, 0) or 0)
+        before_flag = bool(room.get("meld_scored_this_trick"))
+        before_len = len((room.get("scored_melds", {}) or {}).get(player_name, []) or [])
+
+        if mtype == "marriage":
+            for c in cards:
+                await process_action(_DUMMY_WS, room_id, player_name, {
+                    "action": "start_marriage",
+                    "card": {"code": c.get("code"), "uid": c.get("uid")}
+                })
+            await process_action(_DUMMY_WS, room_id, player_name, {"action": "score_marriage"})
+        else:
+            payload = [{"code": c.get("code"), "uid": c.get("uid")} for c in cards]
+            await process_action(_DUMMY_WS, room_id, player_name, {"action": "score_meld", "cards": payload})
+
+        room_after = ROOMS.get(room_id) or room
+        after_score = int((room_after.get("scores", {}) or {}).get(player_name, 0) or 0)
+        after_flag = bool(room_after.get("meld_scored_this_trick"))
+        after_len = len((room_after.get("scored_melds", {}) or {}).get(player_name, []) or [])
+
+        committed = (after_score > before_score) or (after_len > before_len) or (after_flag and not before_flag)
+        if not committed:
+            log.info(f"[CPU SCORE NO-COMMIT] player={player_name} meld_type={mtype} cards={[c.get('code') for c in cards]}")
+            log.info(f"[CPU SCORE END] room={room_id} player={player_name} result=no_commit meld_type={mtype} dt={time.monotonic() - _cpu_score_t0:.3f}s")
+            return False
+        log.info(f"[CPU SCORE END] room={room_id} player={player_name} result=committed meld_type={mtype} dt={time.monotonic() - _cpu_score_t0:.3f}s")
+        return True
+    except Exception as e:
+        log.exception(f"[CPU SCORE ERROR] room={room_id} player={player_name} err={e}")
+        log.info(f"[CPU SCORE END] room={room_id} player={player_name} result=exception dt={time.monotonic() - _cpu_score_t0:.3f}s")
+        return False
 
 class _NoopWS:
     async def send_json(self, *args, **kwargs):
@@ -1561,9 +1925,11 @@ async def cpu_maybe_act(room_id: str):
         return
 
     async def _runner():
+        _runner_t0 = time.monotonic()
         r = ROOMS.get(room_id)
         if not r:
             return
+        log.info(f"[CPU RUNNER START] room={room_id}")
         r["_cpu_running"] = True
         try:
             steps = 0
@@ -1575,11 +1941,20 @@ async def cpu_maybe_act(room_id: str):
 
                 phase = (r2.get("phase") or "").strip()
                 if phase in ("", "waiting"):
+                    log.info(f"[CPU RUNNER BREAK] room={room_id} reason=bad_phase phase={phase!r} steps={steps}")
                     break
 
                 cur = r2.get("current_turn")
                 if not cur or not _is_cpu(r2, cur):
+                    log.info(f"[CPU RUNNER BREAK] room={room_id} reason=human_or_no_turn phase={phase} current_turn={cur!r} steps={steps}")
                     break
+
+                _step_t0 = time.monotonic()
+                log.info(
+                    f"[CPU STEP START] room={room_id} step={steps+1} phase={phase} current_turn={cur} "
+                    f"post_trick_draws={bool(r2.get('post_trick_draws'))} trick_len={len(r2.get('current_trick', []) or [])} "
+                    f"deck={len(r2.get('deck', []) or [])}"
+                )
 
                 # CPU delay (simple for now; reconnect/takeover delays come later)
                 # Phase 3 pacing: slow down CPU chains so humans can see the table.
@@ -1596,71 +1971,167 @@ async def cpu_maybe_act(room_id: str):
                 # CPU ACTION CHOICE
                 # ------------------------------------------------------------
                 # Phase 3 begins with a mandatory "pickup_melds" action by the leader.
-                cur_player = _get_player_obj(r2, cur) or {}
-                takeover_delay = _cpu_delay_for_player(cur_player)
-
                 if phase == "phase3" and not r2.get("phase3_melds_picked"):
                     # CPU_PHASE3_PICKUP_DELAY: give humans time to see melds before pickup
-                    await asyncio.sleep(max(6.0, takeover_delay))
-                    r_check = ROOMS.get(room_id) or {}
-                    if not _is_cpu(r_check, cur):
-                        break
+                    await asyncio.sleep(6.0)
+                    log.info(f"[CPU ACTION] room={room_id} player={cur} action=pickup_melds")
                     await process_action(_DUMMY_WS, room_id, cur, {"action": "pickup_melds"})
+                    log.info(f"[CPU STEP END] room={room_id} step={steps+1} player={cur} action=pickup_melds dt={time.monotonic() - _step_t0:.3f}s")
 
                 elif r2.get("post_trick_draws"):
+                    if _cpu_room_level(r2) >= 2 and not r2.get("meld_scored_this_trick"):
+                        try:
+                            log.info(f"[CPU ACTION] room={room_id} player={cur} action=try_score")
+                            scored = await _cpu_try_score_now(room_id, cur)
+                        except Exception as e:
+                            log.exception(f"[CPU LOOP SCORE CRASH] room={room_id} player={cur} err={e}")
+                            scored = False
+                        if scored:
+                            log.info(f"[CPU STEP END] room={room_id} step={steps+1} player={cur} action=score_then_continue dt={time.monotonic() - _step_t0:.3f}s")
+                            await asyncio.sleep(1.0)
+                            steps += 1
+                            await asyncio.sleep(0)
+                            continue
+
                     # CPU_DRAW_DELAY_POST_TRICK: give humans time to see the completed trick
-                    await asyncio.sleep(max(2.5, takeover_delay))
-                    r_check = ROOMS.get(room_id) or {}
-                    if not _is_cpu(r_check, cur):
-                        break
+                    await asyncio.sleep(2.5)
+                    log.info(f"[CPU ACTION] room={room_id} player={cur} action=draw_card")
                     await process_action(_DUMMY_WS, room_id, cur, {"action": "draw_card"})
+                    log.info(f"[CPU STEP END] room={room_id} step={steps+1} player={cur} action=draw_card dt={time.monotonic() - _step_t0:.3f}s")
 
                 else:
-                    # Try to play a legal card. If the first choice is illegal (Phase 3 follow-suit rules),
-                    # iterate through the hand until one succeeds.
-                    hand = (r2.get("hands", {}).get(cur) or [])
-                    # stable ordering so behavior is reproducible
-                    hand_sorted = sorted(hand, key=lambda c: (_rank_value(c.get("code","")), c.get("code","")))
+                    uid = None
+
+                    try:
+                        if _cpu_room_level(r2) >= 2:
+                            uid = _cpu_choose_play_uid_level2(r2, cur)
+                    except Exception as e:
+                        log.exception(f"[CPU CHOOSE ERROR] room={room_id} player={cur} err={e}")
+                        uid = None
+
+                    if not uid:
+                        uid = _choose_cpu_play_uid(r2, cur)
+
+                    if not uid:
+                        hand = (r2.get("hands", {}).get(cur) or [])
+                        meld = (r2.get("melds", {}).get(cur) or [])
+                        combined = hand + meld
+                        if combined:
+                            uid = (combined[0] or {}).get("uid")
+
+                    if not uid:
+                        break
+
                     before_turn = r2.get("current_turn")
                     before_trick_len = len(r2.get("current_trick", []) or [])
-                    played = False
+                    log.info(f"[CPU ACTION] room={room_id} player={cur} action=play_card uid={uid}")
+                    await process_action(_DUMMY_WS, room_id, cur, {"action": "play_card", "card": {"uid": uid}})
 
-                    for c in hand_sorted:
-                        uid = (c or {}).get("uid")
-                        if not uid:
+                    r_after = ROOMS.get(room_id) or {}
+                    after_turn = r_after.get("current_turn")
+                    after_trick_len = len(r_after.get("current_trick", []) or [])
+
+                    if after_turn == before_turn and after_trick_len == before_trick_len:
+                        fallback_uid = _choose_cpu_play_uid(r_after, cur)
+
+                        if fallback_uid and fallback_uid != uid:
+                            log.info(f"[CPU ACTION] room={room_id} player={cur} action=play_card_fallback uid={fallback_uid}")
+                            await process_action(_DUMMY_WS, room_id, cur, {
+                                "action": "play_card",
+                                "card": {"uid": fallback_uid}
+                            })
+                            log.info(f"[CPU STEP END] room={room_id} step={steps+1} player={cur} action=play_card_fallback dt={time.monotonic() - _step_t0:.3f}s")
+                            await asyncio.sleep(0)
                             continue
-                        r_check = ROOMS.get(room_id) or {}
-                        if not _is_cpu(r_check, cur):
-                            break
-                        if takeover_delay > 0:
-                            await asyncio.sleep(takeover_delay)
-                            r_check = ROOMS.get(room_id) or {}
-                            if not _is_cpu(r_check, cur):
-                                break
-                        await process_action(_DUMMY_WS, room_id, cur, {"action": "play_card", "card": {"uid": uid}})
 
-                        r_after = ROOMS.get(room_id) or {}
-                        after_turn = r_after.get("current_turn")
-                        after_trick_len = len(r_after.get("current_trick", []) or [])
-                        # success heuristic: trick advanced OR turn advanced
-                        if after_turn != before_turn or after_trick_len != before_trick_len:
-                            played = True
-                            break
-
-                    if not played:
-                        # No legal play found (should be rare). Bail out to avoid infinite loop.
+                        log.info(f"[CPU RUNNER BREAK] room={room_id} reason=no_progress phase={phase} player={cur} steps={steps}")
                         break
 
 
+                log.info(f"[CPU STEP END] room={room_id} step={steps+1} player={cur} action=complete dt={time.monotonic() - _step_t0:.3f}s")
                 steps += 1
                 # yield control; allows WS messages/state broadcasts to flush
                 await asyncio.sleep(0)
         finally:
+            log.info(f"[CPU RUNNER END] room={room_id} total_dt={time.monotonic() - _runner_t0:.3f}s")
             r3 = ROOMS.get(room_id)
             if r3 is not None:
                 r3["_cpu_running"] = False
 
     asyncio.create_task(_runner())
+
+
+async def _start_cpu_style_game(room_id: str, host_name: str, cpu_level: int = 2, cpu_scores_enabled: bool = True):
+    room = ROOMS.get(room_id)
+    if not room:
+        return None
+
+    _cpu_fill_room_to_four(room)
+
+    players = [p['name'] for p in room.get('players', [])]
+    if len(players) != MAX_SEATS:
+        return {"error": "need_4_seats"}
+
+    lead = random.choice(players)
+    room['lead'] = lead
+    room['current_turn'] = lead
+    room['phase'] = 'lead_selection'
+    room['round_start_lead'] = lead
+
+    room['awaiting_next_round'] = False
+    room['count_required'] = False
+    room['count_done'] = False
+
+    await broadcast_state_without_hands(room_id)
+
+    deck = new_deck_full_132()
+    room['deck'] = deck
+    room['hands'] = deal_cards_to_players(room, 9)
+
+    room['current_trick'] = []
+    room['last_completed_trick'] = []
+    room['pending_trick_clear'] = False
+    room['phase'] = 'phase1'
+    room['marriage_pending'] = None
+    room['post_trick_draws'] = False
+    room['draw_order'] = []
+    room['draw_index'] = 0
+    room['last_trick_winner'] = None
+    room['trump_suit'] = None
+    room['temp_melds'] = {}
+    room['scored_melds'] = {}
+    room['meld_scored_this_trick'] = False
+    room['phase3_melds_picked'] = False
+    room['ready_to_start'] = True
+
+    room['won_tricks'] = {}
+    room['_won_trick_sigs'] = set()
+
+    room['cpu_difficulty'] = cpu_level
+    room['cpu_level'] = cpu_level
+    room['cpu_scores_enabled'] = bool(cpu_scores_enabled)
+
+    for p in players:
+        room['scores'][p] = 0
+        room['melds'].setdefault(p, [])
+        room['scored_melds'].setdefault(p, [])
+        room['won_tricks'].setdefault(p, [])
+
+    await _emit_deck_count(room_id, len(room.get('deck', [])))
+    for p in players:
+        await send_state_update_to_player(room_id, p)
+
+    await _send_to_room(room_id, {'type': 'game_start', 'phase': 'phase1', 'lead': lead})
+    await broadcast_lobby_rooms()
+    await cpu_maybe_act(room_id)
+
+    return {
+        'started': True,
+        'room_id': room_id,
+        'cpu_filled': True,
+        'cpu_level': cpu_level,
+        'cpu_scores_enabled': bool(cpu_scores_enabled),
+    }
 
 @app.post("/api/start_cpu_game")
 async def api_start_cpu_game(req: Request):
@@ -1677,57 +2148,12 @@ async def api_start_cpu_game(req: Request):
     if room.get('phase') != 'waiting':
         return JSONResponse({'error': 'bad_phase'}, 400)
 
-    _cpu_fill_room_to_four(room)
-    players = [p['name'] for p in room.get('players', [])]
-    if len(players) != MAX_SEATS:
-        return JSONResponse({'error': 'need_4_seats'}, 400)
+    cpu_level = int(b.get('cpu_level', 2) or 2)
 
-    lead = random.choice(players)
-    room['lead'] = lead
-    room['current_turn'] = lead
-    room['phase'] = 'lead_selection'
-    room['round_start_lead'] = lead
-
-    room['awaiting_next_round'] = False
-    room['count_required'] = False
-    room['count_done'] = False
-
-    await broadcast_state_without_hands(rid)
-
-    deck = new_deck_full_132()
-    room['deck'] = deck
-    room['hands'] = deal_cards_to_players(room, 9)
-
-    room['current_trick'] = []
-    room['phase'] = 'phase1'
-    room['marriage_pending'] = None
-    room['post_trick_draws'] = False
-    room['draw_order'] = []
-    room['draw_index'] = 0
-    room['last_trick_winner'] = None
-    room['trump_suit'] = None
-    room['temp_melds'] = {}
-    room['scored_melds'] = {}
-    room['meld_scored_this_trick'] = False
-    room['phase3_melds_picked'] = False
-    room['ready_to_start'] = True
-
-    room['won_tricks'] = {}
-    room['_won_trick_sigs'] = set()
-    for p in players:
-        room['scores'][p] = 0
-        room['melds'].setdefault(p, [])
-        room['scored_melds'].setdefault(p, [])
-        room['won_tricks'].setdefault(p, [])
-
-    await _emit_deck_count(rid, len(room.get('deck', [])))
-    for p in players:
-        await send_state_update_to_player(rid, p)
-
-    await _send_to_room(rid, {'type': 'game_start', 'phase': 'phase1', 'lead': lead})
-    await broadcast_lobby_rooms()
-    await cpu_maybe_act(rid)
-    return {'started': True, 'room_id': rid, 'cpu_filled': True}
+    result = await _start_cpu_style_game(rid, pn, cpu_level=cpu_level, cpu_scores_enabled=True)
+    if isinstance(result, dict) and result.get("error"):
+        return JSONResponse(result, 400)
+    return result or {'started': True, 'room_id': rid, 'cpu_filled': True}
 
 @app.post("/api/start_game")
 async def api_start_game(req: Request):
@@ -1769,6 +2195,7 @@ async def api_start_game(req: Request):
     room["hands"] = deal_cards_to_players(room, 9)
 
     room["current_trick"] = []
+    room["last_completed_trick"] = []
     room["pending_trick_clear"] = False
     room["phase"] = "phase1"
     room["marriage_pending"] = None
@@ -1871,7 +2298,8 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
                 "type": "aces_tens_counted",
                 "bonus": bonus,
                 "scores": room.get("scores", {}),
-                "msg": "Aces and 10s counted."
+                "msg": "Aces and 10s counted.",
+                "play_score_any": True
             })
 
             # ✅ standardized "no winner" text
@@ -1932,6 +2360,11 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
             return
 
         await perform_global_meld_pickup(room_id)
+        room = ROOMS.get(room_id) or room
+        room["current_turn"] = leader
+        await broadcast_state_without_hands(room_id)
+        for p in _players_order(room):
+            await send_state_update_to_player(room_id, p)
         await ws.send_json({"type": "info", "msg": "melds_picked_up"})
         return
 
@@ -2018,9 +2451,9 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
             order = _players_order(room)
 
             if len(room["current_trick"]) < 4:
-                ci = order.index(player)
-                nxt = order[(ci + 1) % 4]
+                nxt = _next_player_ccw(room, player)
                 room["current_turn"] = nxt
+                log.info(f"[PHASE3 TURN ADVANCE] room={room_id} played_by={player} next_turn={nxt} trick_len={len(room.get('current_trick', []) or [])} trump={room.get('trump_suit')!r}")
 
                 # Phase 3 last-trick auto-play (ONLY when it is truly the last trick):
                 # After the lead card is played, if there are exactly 3 total cards remaining
@@ -2056,6 +2489,7 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
 
             winner = phase3_determine_winner(room)
             room["last_trick_winner"] = winner
+            room["last_completed_trick"] = [dict(t) for t in (room.get("current_trick", []) or [])]
             room["current_turn"] = winner
 
             _append_trick_to_won_pile(room, winner, room["current_trick"])
@@ -2079,6 +2513,10 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
                     break
 
             if all_empty:
+                # Keep the final completed trick visible briefly before the round-end / winner UI appears.
+                # This covers both normal and auto-completed final tricks.
+                await asyncio.sleep(FINAL_TRICK_ROUND_END_DELAY_SAFE)
+
                 winner_code, text = _evaluate_winner_after_round(room)
 
                 if winner_code == "":
@@ -2108,6 +2546,7 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
 
                 else:
                     room["phase"] = "game_over"
+                    await asyncio.sleep(POST_SCORE_SHOWWINNER_DELAY)
                     await _send_to_room(room_id, {
                         "type": "show_winner",
                         "winner": winner_code,
@@ -2198,6 +2637,7 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
                         winner = t["player"]
 
         room["last_trick_winner"] = winner
+        room["last_completed_trick"] = [dict(t) for t in (trick or [])]
 
         _append_trick_to_won_pile(room, winner, trick)
 
@@ -2546,7 +2986,7 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
                     break
             if found:
                 hand.remove(found)
-                meld.append(found)
+                _append_card_to_meld_unique(meld, found)
 
         room["scored_melds"][player].append({
             "category": "marriage",
@@ -2557,6 +2997,7 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
         room["marriage_pending"] = None
         room.setdefault("temp_melds", {})
         room["temp_melds"][player] = []
+        room["meld_scored_this_trick"] = True
 
         await send_state_update_to_player(room_id, player)
         await broadcast_state_without_hands(room_id)
@@ -2740,11 +3181,24 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
                 if k_cards and q_cards:
                     k_uid = k_cards[0]["uid"]
                     q_uid = q_cards[0]["uid"]
+
+                    marriage_pair_in_meld = False
                     if uid_source.get(k_uid) == "meld" and uid_source.get(q_uid) == "meld":
+                        for rec in room.get("scored_melds", {}).get(player, []) or []:
+                            if rec.get("category") != "marriage":
+                                continue
+                            if rec.get("suit") != trump:
+                                continue
+                            rec_uids = set(rec.get("uids", []) or [])
+                            if k_uid in rec_uids and q_uid in rec_uids:
+                                marriage_pair_in_meld = True
+                                break
+
+                    if marriage_pair_in_meld:
                         category = "quinte_trump"
                         points = 250
                     else:
-                        await ws.send_json({"type": "info", "msg": "quinte_requires_marriage_in_meld"})
+                        await ws.send_json({"type": "info", "msg": "quinte_requires_same_scored_marriage_in_meld"})
                         return
 
         if category is None and len(chosen_cards) == 4:
@@ -2813,7 +3267,7 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
                     for h in list(hand):
                         if h["uid"] == uid4:
                             hand.remove(h)
-                            meld_area.append(h)
+                            _append_card_to_meld_unique(meld_area, h)
                             break
 
             scored_list.append({
@@ -2882,23 +3336,18 @@ async def websocket_endpoint(
         return
 
     if not name_exists:
-        room["players"].append({"name": player_name, "is_cpu": False, "reconnect_token": make_reconnect_token(), "connection_state": "human_active", "disconnect_at": None, "reconnect_deadline": None, "cpu_takeover_started_at": None, "cpu_playing_for_name": None})
+        room["players"].append({"name": player_name})
         room["scores"].setdefault(player_name, 0)
         room["melds"].setdefault(player_name, [])
         room["scored_melds"].setdefault(player_name, [])
         room["won_tricks"].setdefault(player_name, [])
-
-    for p in room.get("players", []) or []:
-        _ensure_player_runtime_meta(p)
 
     room.setdefault("meld_scored_this_trick", False)
     room.setdefault("phase3_melds_picked", False)
     room.setdefault("pending_trick_clear", False)
     room.setdefault("ready_to_start", len(room.get("players", [])) >= MAX_SEATS)
 
-    await _mark_player_connected(room_id, player_name)
     await _register_single_socket(room_id, player_name, ws)
-    await broadcast_state_without_hands(room_id)
     await send_state_update_to_player(room_id, player_name)
 
     try:
@@ -2931,10 +3380,6 @@ async def websocket_endpoint(
                         await broadcast_state_without_hands(room_id)
 
                     await broadcast_lobby_rooms()
-            elif room:
-                remaining = ROOM_SOCKETS.get(room_id, {}).get(player_name, []) or []
-                if not remaining:
-                    await _mark_player_disconnected(room_id, player_name)
         except:
             pass
 
@@ -2964,10 +3409,6 @@ async def websocket_endpoint(
                         await broadcast_state_without_hands(room_id)
 
                     await broadcast_lobby_rooms()
-            elif room:
-                remaining = ROOM_SOCKETS.get(room_id, {}).get(player_name, []) or []
-                if not remaining:
-                    await _mark_player_disconnected(room_id, player_name)
         except:
             pass
 
