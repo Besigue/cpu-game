@@ -2288,12 +2288,8 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
             room["pending_trick_clear"] = False
             await _send_to_room(room_id, {"type": "clear_trick"})
 
-            # ✅ IMPORTANT: if bonus pushed someone to 400+, end game NOW.
-            winner_code, text = _evaluate_winner_after_round(room)
-            if winner_code and winner_code != "":
-                await _end_game_now(room_id, room, winner_code, text, bonus=bonus)
-                return
-
+            # Always emit aces_tens_counted first so every client can queue SCORE_ANY,
+            # even when the added Brisques points immediately produce the game winner.
             await _send_to_room(room_id, {
                 "type": "aces_tens_counted",
                 "bonus": bonus,
@@ -2301,6 +2297,20 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
                 "msg": "Aces and 10s counted.",
                 "play_score_any": True
             })
+
+            room["phase"] = "round_end_wait"
+
+            await broadcast_state_without_hands(room_id)
+            for p in _players_order(room):
+                await send_state_update_to_player(room_id, p)
+
+            # Give SCORE_ANY a moment to start before any show_winner / game_over flow.
+            await asyncio.sleep(0.7)
+
+            winner_code, text = _evaluate_winner_after_round(room)
+            if winner_code and winner_code != "":
+                await _end_game_now(room_id, room, winner_code, text, bonus=bonus)
+                return
 
             # ✅ standardized "no winner" text
             await _send_to_room(room_id, {
@@ -2311,12 +2321,6 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
                 "last_trick_winner": room.get("last_trick_winner"),
                 "bonus": bonus
             })
-
-            room["phase"] = "round_end_wait"
-
-            await broadcast_state_without_hands(room_id)
-            for p in _players_order(room):
-                await send_state_update_to_player(room_id, p)
             return
 
         if action == "next_round":
