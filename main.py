@@ -1,5 +1,5 @@
 # ============================
-# main.py — Besigue Server (v81.0-CPU-TEST-PRACTICE-USES-STARTCPU-PATH)
+# main.py — Besigue Server (v81.94-ROUND-CONTROL-RECONNECT-TOKEN)
 #
 # Based on your pasted v76.8 (NO rewrites / no new files).
 #
@@ -28,7 +28,7 @@ from itertools import combinations
 
 log = logging.getLogger("besigue")
 logging.basicConfig(level=logging.INFO)
-log.info("BOOT main.py v81.0 PRACTICE_USES_STARTCPU_PATH loaded")
+log.info("BOOT main.py v81.94 ROUND_CONTROL_RECONNECT_TOKEN loaded")
 
 app = FastAPI()
 
@@ -118,6 +118,25 @@ def _unique_name_in_room(room: dict, desired: str) -> str:
             return candidate
 
     return f"{desired}{uuid.uuid4().hex[:4]}"
+
+
+def _ensure_reconnect_token(room: dict, player_name: str) -> str:
+    """Return/create a stable reconnect token for this physical seat."""
+    if not room or not player_name:
+        return ""
+    room.setdefault("reconnect_tokens", {})
+    tok = room["reconnect_tokens"].get(player_name)
+    if not tok:
+        tok = uuid.uuid4().hex + uuid.uuid4().hex
+        room["reconnect_tokens"][player_name] = tok
+    return tok
+
+
+def _player_exists_in_room(room: dict, player_name: str) -> bool:
+    try:
+        return any(p.get("name") == player_name for p in room.get("players", []) or [])
+    except Exception:
+        return False
 
 
 def canonical_card_with_uid(code: str):
@@ -1133,7 +1152,7 @@ async def send_state_update_to_player(room_id: str, player_name: str):
     if room.get("awaiting_next_round"):
         control_name = room.get("host") or "Host"
         if player_name == control_name:
-            data["round_end_wait_text"] = "Click Count Aces & Tens" if room.get("count_required", False) else "Click Next Round"
+            data["round_end_wait_text"] = "Click Count Aces & Tens" if room.get("count_required", False) else "Click Play Next Round"
         else:
             data["round_end_wait_text"] = f"Waiting for {control_name} to Count Aces & Tens" if room.get("count_required", False) else f"Waiting for {control_name} to continue the game"
 
@@ -1204,8 +1223,10 @@ async def api_create_room(req: Request):
         "awaiting_next_round": False,
         "count_required": False,
         "count_done": False,
+        "reconnect_tokens": {},
     }
 
+    _ensure_reconnect_token(room, pn)
     ROOMS[rid] = room
     WS_CLIENTS.setdefault(rid, [])
     ROOM_SOCKETS.setdefault(rid, {})
@@ -1215,7 +1236,8 @@ async def api_create_room(req: Request):
         "room_id": rid,
         "room_label": room["label"],
         "player_name": pn,
-        "room_host": room["host"]
+        "room_host": room["host"],
+        "reconnect_token": _ensure_reconnect_token(room, pn)
     }
 
 
@@ -1283,7 +1305,9 @@ def _create_started_practice_room_for_player(pn: str) -> dict:
         "count_done": False,
         "cpu_difficulty": 1,
         "cpu_level": 1,
+        "reconnect_tokens": {},
     }
+    _ensure_reconnect_token(room, pn)
     ROOMS[rid] = room
     WS_CLIENTS.setdefault(rid, [])
     ROOM_SOCKETS.setdefault(rid, {})
@@ -1304,7 +1328,7 @@ async def api_join_room(req: Request):
         room = _create_started_practice_room_for_player(pn)
 
         try:
-            await _start_cpu_style_game(room["room_id"], pn, cpu_level=2, cpu_scores_enabled=True)
+            await _start_cpu_style_game(room["room_id"], pn, cpu_level=2, cpu_scores_enabled=False)
         except Exception as e:
             log.exception(f"[PRACTICE START ERROR] room={room.get('room_id')} host={pn} err={e}")
             return JSONResponse({"error": "practice_start_failed"}, 500)
@@ -1315,7 +1339,8 @@ async def api_join_room(req: Request):
             "room_id": room["room_id"],
             "player_name": pn,
             "room_label": room["label"],
-            "room_host": room["host"]
+            "room_host": room["host"],
+            "reconnect_token": _ensure_reconnect_token(room, pn)
         }
 
     if rid not in ROOMS:
@@ -1331,6 +1356,7 @@ async def api_join_room(req: Request):
     room.setdefault("awaiting_next_round", False)
     room.setdefault("count_required", False)
     room.setdefault("count_done", False)
+    room.setdefault("reconnect_tokens", {})
 
     existing_names = [p.get("name") for p in room["players"] if p.get("name")]
 
@@ -1356,7 +1382,8 @@ async def api_join_room(req: Request):
             "room_id": rid,
             "player_name": pn,
             "room_label": room["label"],
-            "room_host": room["host"]
+            "room_host": room["host"],
+            "reconnect_token": _ensure_reconnect_token(room, pn)
         }
 
     if pn_req not in existing_names:
@@ -1375,7 +1402,8 @@ async def api_join_room(req: Request):
             "room_id": rid,
             "player_name": pn_req,
             "room_label": room["label"],
-            "room_host": room["host"]
+            "room_host": room["host"],
+            "reconnect_token": _ensure_reconnect_token(room, pn_req)
         }
 
     return {
@@ -1383,7 +1411,47 @@ async def api_join_room(req: Request):
         "room_id": rid,
         "player_name": pn_req,
         "room_label": room["label"],
-        "room_host": room["host"]
+        "room_host": room["host"],
+        "reconnect_token": _ensure_reconnect_token(room, pn_req)
+    }
+
+
+# ---------------------------------------------------
+# RECONNECT ROOM
+# ---------------------------------------------------
+@app.post("/api/reconnect_room")
+async def api_reconnect_room(req: Request):
+    b = await req.json()
+    rid = b.get("room_id")
+    token = (b.get("reconnect_token") or "").strip()
+
+    if not rid or rid not in ROOMS:
+        return JSONResponse({"ok": False, "error": "room_not_found"}, 404)
+    if not token:
+        return JSONResponse({"ok": False, "error": "missing_reconnect_token"}, 400)
+
+    room = ROOMS[rid]
+    room.setdefault("reconnect_tokens", {})
+
+    matched_player = ""
+    for pname, stored in (room.get("reconnect_tokens", {}) or {}).items():
+        if stored and stored == token:
+            matched_player = pname
+            break
+
+    if not matched_player or not _player_exists_in_room(room, matched_player):
+        return JSONResponse({"ok": False, "error": "invalid_reconnect_token"}, 404)
+
+    room["ready_to_start"] = (len(room.get("players", []) or []) >= MAX_SEATS)
+
+    return {
+        "ok": True,
+        "room_id": rid,
+        "player_name": matched_player,
+        "room_label": room.get("label", rid),
+        "room_host": room.get("host", ""),
+        "phase": room.get("phase", ""),
+        "reconnect_token": token
     }
 
 
@@ -1416,6 +1484,10 @@ async def api_leave_room(req: Request):
     if "scored_melds" in room and isinstance(room["scored_melds"], dict):
         room["scored_melds"].pop(pn, None)
     room.get("won_tricks", {}).pop(pn, None)
+    try:
+        room.get("reconnect_tokens", {}).pop(pn, None)
+    except Exception:
+        pass
 
     room_sockets = ROOM_SOCKETS.get(rid, {})
     personal_sockets = room_sockets.pop(pn, [])
@@ -1846,6 +1918,11 @@ async def _cpu_try_score_now(room_id: str, player_name: str) -> bool:
     if not room.get("post_trick_draws"):
         return False
     if room.get("meld_scored_this_trick"):
+        return False
+    # v81.96: Practice Room rule — CPU players may play/draw, but may not score meld points.
+    # Aces & Tens are still counted normally at round end.
+    if _is_cpu(room, player_name) and not bool(room.get("cpu_scores_enabled", True)):
+        log.info(f"[CPU SCORE SKIP] room={room_id} player={player_name} reason=cpu_scores_disabled")
         return False
     if _cpu_room_level(room) < 2:
         return False
@@ -2288,8 +2365,12 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
             room["pending_trick_clear"] = False
             await _send_to_room(room_id, {"type": "clear_trick"})
 
-            # Always emit aces_tens_counted first so every client can queue SCORE_ANY,
-            # even when the added Brisques points immediately produce the game winner.
+            # ✅ IMPORTANT: if bonus pushed someone to 400+, end game NOW.
+            winner_code, text = _evaluate_winner_after_round(room)
+            if winner_code and winner_code != "":
+                await _end_game_now(room_id, room, winner_code, text, bonus=bonus)
+                return
+
             await _send_to_room(room_id, {
                 "type": "aces_tens_counted",
                 "bonus": bonus,
@@ -2297,20 +2378,6 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
                 "msg": "Aces and 10s counted.",
                 "play_score_any": True
             })
-
-            room["phase"] = "round_end_wait"
-
-            await broadcast_state_without_hands(room_id)
-            for p in _players_order(room):
-                await send_state_update_to_player(room_id, p)
-
-            # Give SCORE_ANY a moment to start before any show_winner / game_over flow.
-            await asyncio.sleep(0.7)
-
-            winner_code, text = _evaluate_winner_after_round(room)
-            if winner_code and winner_code != "":
-                await _end_game_now(room_id, room, winner_code, text, bonus=bonus)
-                return
 
             # ✅ standardized "no winner" text
             await _send_to_room(room_id, {
@@ -2321,6 +2388,12 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
                 "last_trick_winner": room.get("last_trick_winner"),
                 "bonus": bonus
             })
+
+            room["phase"] = "round_end_wait"
+
+            await broadcast_state_without_hands(room_id)
+            for p in _players_order(room):
+                await send_state_update_to_player(room_id, p)
             return
 
         if action == "next_round":
@@ -2918,6 +2991,11 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
     # SCORE MARRIAGE
     # ============================================================
     if action == "score_marriage":
+        # v81.96: Practice Room rule — CPU players may not score meld/marriage points.
+        if _is_cpu(room, player) and not bool(room.get("cpu_scores_enabled", True)):
+            await ws.send_json({"type": "info", "msg": "cpu_scoring_disabled"})
+            return
+
         mp = room.get("marriage_pending")
         if not mp or mp["player"] != player:
             await ws.send_json({"type": "info", "msg": "no_marriage_pending"})
@@ -3067,6 +3145,11 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
     # SCORE MELD (Phase 2) — v75.3 rules
     # ============================================================
     if action == "score_meld":
+        # v81.96: Practice Room rule — CPU players may not score meld points.
+        if _is_cpu(room, player) and not bool(room.get("cpu_scores_enabled", True)):
+            await ws.send_json({"type": "info", "msg": "cpu_scoring_disabled"})
+            return
+
         if room.get("phase") != "phase2":
             await ws.send_json({"type": "info", "msg": "melds_only_in_phase2"})
             return
