@@ -1,5 +1,5 @@
 # ============================
-# main.py — Besigue Server (v81.94-ROUND-CONTROL-RECONNECT-TOKEN)
+# main.py — Besigue Server (v82.4-TAKEOVER-RUNNER-CONTINUATION)
 #
 # Based on your pasted v76.8 (NO rewrites / no new files).
 #
@@ -28,7 +28,7 @@ from itertools import combinations
 
 log = logging.getLogger("besigue")
 logging.basicConfig(level=logging.INFO)
-log.info("BOOT main.py v81.94 ROUND_CONTROL_RECONNECT_TOKEN loaded")
+log.info("BOOT main.py v82.4 TAKEOVER_RUNNER_CONTINUATION loaded")
 
 app = FastAPI()
 
@@ -1093,6 +1093,7 @@ async def broadcast_state_without_hands(room_id: str):
 
         "count_required": room.get("count_required", False),
         "count_done": room.get("count_done", False),
+        "player_statuses": _room_statuses(room),
     }
     await _send_to_room(room_id, {"type": "state_update", "data": data})
 
@@ -1147,6 +1148,7 @@ async def send_state_update_to_player(room_id: str, player_name: str):
         "count_done": room.get("count_done", False),
 
         "hands": {player_name: player_hand},
+        "player_statuses": _room_statuses(room),
     }
 
     if room.get("awaiting_next_round"):
@@ -1224,6 +1226,7 @@ async def api_create_room(req: Request):
         "count_required": False,
         "count_done": False,
         "reconnect_tokens": {},
+        "player_statuses": {},
     }
 
     _ensure_reconnect_token(room, pn)
@@ -1306,6 +1309,7 @@ def _create_started_practice_room_for_player(pn: str) -> dict:
         "cpu_difficulty": 1,
         "cpu_level": 1,
         "reconnect_tokens": {},
+        "player_statuses": {},
     }
     _ensure_reconnect_token(room, pn)
     ROOMS[rid] = room
@@ -1537,6 +1541,11 @@ async def api_leave_room(req: Request):
 # CPU SUPPORT (v1) — cpu-test only (no VIP gating yet)
 # ============================================================
 CPU_NORMAL_DELAY_RANGE = (0.6, 1.2)  # seconds
+# Reconnect / CPU takeover timing (test branch)
+CPU_TAKEOVER_GRACE_SECONDS = 30.0
+CPU_TAKEOVER_SLOW_TURN_SECONDS = 30.0
+CPU_TAKEOVER_SLOW_WINDOW_SECONDS = 120.0
+
 
 def _get_player_obj(room: dict, name: str):
     for p in room.get('players', []) or []:
@@ -1564,6 +1573,115 @@ def _is_cpu(room_or_name, maybe_name=None):
     except Exception:
         pass
     return isinstance(name, str) and name.startswith("CPU")
+
+
+
+def _room_statuses(room: dict) -> dict:
+    room.setdefault("player_statuses", {})
+    for pobj in room.get("players", []) or []:
+        name = pobj.get("name")
+        if not name:
+            continue
+        st = room["player_statuses"].setdefault(name, {})
+        st.setdefault("is_cpu", bool(pobj.get("is_cpu")) or str(name).startswith("CPU"))
+        if st.get("is_cpu"):
+            st["connection_state"] = "cpu_player"
+        else:
+            st.setdefault("connection_state", "human_connected")
+            st.setdefault("disconnected_at", None)
+            st.setdefault("cpu_takeover_active", False)
+            st.setdefault("cpu_takeover_started_at", None)
+    return room["player_statuses"]
+
+
+def _seat_has_active_socket(room_id: str, player_name: str) -> bool:
+    try:
+        return bool(ROOM_SOCKETS.get(room_id, {}).get(player_name, []) or [])
+    except Exception:
+        return False
+
+
+def _mark_human_connected(room_id: str, player_name: str):
+    room = ROOMS.get(room_id)
+    if not room or _is_cpu(room, player_name):
+        return
+    st = _room_statuses(room).setdefault(player_name, {})
+    st["is_cpu"] = False
+    st["connection_state"] = "human_connected"
+    st["disconnected_at"] = None
+    st["cpu_takeover_active"] = False
+    st["cpu_takeover_started_at"] = None
+
+
+def _mark_human_disconnected(room_id: str, player_name: str):
+    room = ROOMS.get(room_id)
+    if not room or _is_cpu(room, player_name):
+        return
+    st = _room_statuses(room).setdefault(player_name, {})
+    now = time.monotonic()
+    st["is_cpu"] = False
+    st["connection_state"] = "human_disconnected_reserved"
+    st["disconnected_at"] = now
+    st["cpu_takeover_active"] = False
+    st["cpu_takeover_started_at"] = None
+
+
+def _activate_cpu_takeover(room_id: str, player_name: str):
+    room = ROOMS.get(room_id)
+    if not room or _is_cpu(room, player_name):
+        return False
+    st = _room_statuses(room).setdefault(player_name, {})
+    if _seat_has_active_socket(room_id, player_name):
+        _mark_human_connected(room_id, player_name)
+        return False
+    st["is_cpu"] = False
+    st["connection_state"] = "cpu_takeover_active"
+    st["cpu_takeover_active"] = True
+    st["cpu_takeover_started_at"] = st.get("cpu_takeover_started_at") or time.monotonic()
+    return True
+
+
+def _is_cpu_controlled(room: dict, player_name: str) -> bool:
+    if _is_cpu(room, player_name):
+        return True
+    try:
+        st = _room_statuses(room).get(player_name, {})
+        return bool(st.get("cpu_takeover_active"))
+    except Exception:
+        return False
+
+
+def _cpu_takeover_delay_for_turn(room: dict, player_name: str) -> Optional[float]:
+    """Return a special delay for CPU takeover seats, else None for normal CPU delay."""
+    try:
+        if _is_cpu(room, player_name):
+            return None
+        st = _room_statuses(room).get(player_name, {})
+        if not st.get("cpu_takeover_active"):
+            return None
+        started = float(st.get("cpu_takeover_started_at") or time.monotonic())
+        if (time.monotonic() - started) < CPU_TAKEOVER_SLOW_WINDOW_SECONDS:
+            return CPU_TAKEOVER_SLOW_TURN_SECONDS
+    except Exception:
+        pass
+    return None
+
+
+async def _cpu_takeover_after_grace(room_id: str, player_name: str):
+    """After a human disconnects, reserve their seat, then let CPU control it if they do not return."""
+    await asyncio.sleep(CPU_TAKEOVER_GRACE_SECONDS)
+    room = ROOMS.get(room_id)
+    if not room or room.get("phase") in (None, "", "waiting", "game_over"):
+        return
+    if _seat_has_active_socket(room_id, player_name):
+        _mark_human_connected(room_id, player_name)
+        return
+    if _activate_cpu_takeover(room_id, player_name):
+        log.info(f"[CPU TAKEOVER START] room={room_id} player={player_name}")
+        await broadcast_state_without_hands(room_id)
+        for p in _players_order(room):
+            await send_state_update_to_player(room_id, p)
+        await cpu_maybe_act(room_id)
 
 def _cpu_fill_room_to_four(room: dict):
     """Fill empty seats with CPU players (CPU 1..CPU 3) until 4 total."""
@@ -2022,7 +2140,7 @@ async def cpu_maybe_act(room_id: str):
                     break
 
                 cur = r2.get("current_turn")
-                if not cur or not _is_cpu(r2, cur):
+                if not cur or not _is_cpu_controlled(r2, cur):
                     log.info(f"[CPU RUNNER BREAK] room={room_id} reason=human_or_no_turn phase={phase} current_turn={cur!r} steps={steps}")
                     break
 
@@ -2033,11 +2151,17 @@ async def cpu_maybe_act(room_id: str):
                     f"deck={len(r2.get('deck', []) or [])}"
                 )
 
-                # CPU delay (simple for now; reconnect/takeover delays come later)
-                # Phase 3 pacing: slow down CPU chains so humans can see the table.
-                if room.get("phase") == "phase3":
+                # CPU delay. For CPU takeover seats, pause before each action during the reclaim window.
+                takeover_delay = _cpu_takeover_delay_for_turn(r2, cur)
+                if takeover_delay is not None:
+                    await asyncio.sleep(takeover_delay)
+                    r2_after_wait = ROOMS.get(room_id) or {}
+                    if r2_after_wait.get("current_turn") != cur or not _is_cpu_controlled(r2_after_wait, cur):
+                        log.info(f"[CPU RUNNER BREAK] room={room_id} reason=takeover_reclaimed_or_turn_changed phase={phase} current_turn={cur!r} steps={steps}")
+                        break
+                elif room.get("phase") == "phase3":
                     # After a trick completes, keep the last trick visible a bit before the winning CPU leads.
-                    if room.get("pending_trick_clear") and _is_cpu(room, room.get("current_turn")):
+                    if room.get("pending_trick_clear") and _is_cpu_controlled(room, room.get("current_turn")):
                         await asyncio.sleep(3.0)
                     else:
                         await asyncio.sleep(2.0)
@@ -2134,6 +2258,18 @@ async def cpu_maybe_act(room_id: str):
             r3 = ROOMS.get(room_id)
             if r3 is not None:
                 r3["_cpu_running"] = False
+                # v82.4: If the 50-step safety cap ends while the next turn is still
+                # CPU-controlled, immediately wake a fresh runner. This preserves the
+                # safety cap without leaving the game stuck on a CPU/takeover turn
+                # after reconnect/takeover has advanced many actions.
+                try:
+                    cur3 = r3.get("current_turn")
+                    phase3_now = (r3.get("phase") or "").strip()
+                    if steps >= 50 and cur3 and phase3_now not in ("", "waiting", "game_over") and _is_cpu_controlled(r3, cur3):
+                        log.info(f"[CPU RUNNER CONTINUE] room={room_id} reason=step_cap current_turn={cur3!r}")
+                        asyncio.create_task(cpu_maybe_act(room_id))
+                except Exception:
+                    pass
 
     asyncio.create_task(_runner())
 
@@ -3435,7 +3571,22 @@ async def websocket_endpoint(
     room.setdefault("ready_to_start", len(room.get("players", [])) >= MAX_SEATS)
 
     await _register_single_socket(room_id, player_name, ws)
+    _mark_human_connected(room_id, player_name)
     await send_state_update_to_player(room_id, player_name)
+    await broadcast_state_without_hands(room_id)
+
+    # v82.4: A reconnect can happen after a CPU runner hit its safety cap,
+    # leaving current_turn on a CPU seat. Opening/reopening a websocket should
+    # nudge the runner if the current turn is CPU-controlled. This does not
+    # affect a reclaimed human turn because _mark_human_connected() clears
+    # takeover for that human before this check.
+    try:
+        cur_on_open = room.get("current_turn")
+        if cur_on_open and room.get("phase") not in (None, "", "waiting", "game_over") and _is_cpu_controlled(room, cur_on_open):
+            log.info(f"[CPU RUNNER WAKE] room={room_id} reason=ws_open current_turn={cur_on_open!r}")
+            await cpu_maybe_act(room_id)
+    except Exception:
+        pass
 
     try:
         while True:
@@ -3446,6 +3597,12 @@ async def websocket_endpoint(
         _safe_remove_ws(room_id, player_name, ws)
         try:
             room = ROOMS.get(room_id)
+            if room and room.get("phase") not in (None, "", "waiting", "game_over"):
+                remaining = ROOM_SOCKETS.get(room_id, {}).get(player_name, []) or []
+                if not remaining and not _is_cpu(room, player_name):
+                    _mark_human_disconnected(room_id, player_name)
+                    await broadcast_state_without_hands(room_id)
+                    asyncio.create_task(_cpu_takeover_after_grace(room_id, player_name))
             if room and room.get("phase") == "waiting":
                 remaining = ROOM_SOCKETS.get(room_id, {}).get(player_name, []) or []
                 if not remaining:
@@ -3475,6 +3632,12 @@ async def websocket_endpoint(
         _safe_remove_ws(room_id, player_name, ws)
         try:
             room = ROOMS.get(room_id)
+            if room and room.get("phase") not in (None, "", "waiting", "game_over"):
+                remaining = ROOM_SOCKETS.get(room_id, {}).get(player_name, []) or []
+                if not remaining and not _is_cpu(room, player_name):
+                    _mark_human_disconnected(room_id, player_name)
+                    await broadcast_state_without_hands(room_id)
+                    asyncio.create_task(_cpu_takeover_after_grace(room_id, player_name))
             if room and room.get("phase") == "waiting":
                 remaining = ROOM_SOCKETS.get(room_id, {}).get(player_name, []) or []
                 if not remaining:
