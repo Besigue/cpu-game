@@ -1,5 +1,5 @@
 # ============================
-# main.py — Besigue Server (v82.4-TAKEOVER-RUNNER-CONTINUATION)
+# main.py — Besigue Server (v82.4.7a-GP3-CPU-TAKEOVER-FIX)
 #
 # Based on your pasted v76.8 (NO rewrites / no new files).
 #
@@ -12,6 +12,8 @@
 #  4) Emit optional WS "deck_count" message after deck changes (front-end nudge),
 #     including when deck_count hits 0 so drawPile can show 0.png.
 #  5) Deck count in state payloads is always a safe int >= 0.
+#  6) Fix GP3 CPU takeover no-progress by using hand+meld cards for legal UID checks.
+#  7) Intentional active leave (#leaveGame2) gets immediate CPU takeover actions.
 # ============================
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Query
@@ -28,7 +30,7 @@ from itertools import combinations
 
 log = logging.getLogger("besigue")
 logging.basicConfig(level=logging.INFO)
-log.info("BOOT main.py v82.4 TAKEOVER_RUNNER_CONTINUATION loaded")
+log.info("BOOT main.py v82.4.7a GP3_CPU_TAKEOVER_FIX loaded")
 
 app = FastAPI()
 
@@ -104,6 +106,94 @@ def _normalize_name(raw: Any) -> str:
     if not pn:
         return f"Guest{random.randint(1, 999):03d}"
     return pn
+
+
+def _normalize_identity(raw: Any) -> str:
+    """Stable browser/member identity used only to prevent one person taking
+    multiple seats in the same room. Empty is allowed for older clients.
+    """
+    ident = str(raw or "").strip()
+    if not ident:
+        return ""
+    # Keep it small and log-safe. Wix member ids/local ids are much shorter.
+    return ident[:180]
+
+
+def _seat_identity_for_player(room: dict, player_name: str) -> str:
+    try:
+        room.setdefault("seat_identities", {})
+        ident = room["seat_identities"].get(player_name, "")
+        if ident:
+            return ident
+        for pobj in room.get("players", []) or []:
+            if pobj.get("name") == player_name:
+                return _normalize_identity(pobj.get("identity") or pobj.get("player_identity") or "")
+    except Exception:
+        pass
+    return ""
+
+
+def _set_seat_identity(room: dict, player_name: str, identity: str):
+    try:
+        identity = _normalize_identity(identity)
+        if not identity:
+            return
+        room.setdefault("seat_identities", {})
+        room["seat_identities"][player_name] = identity
+        for pobj in room.get("players", []) or []:
+            if pobj.get("name") == player_name:
+                pobj["identity"] = identity
+                break
+    except Exception:
+        pass
+
+
+
+
+def _is_identity_blocked_from_room(room: dict, identity: str) -> bool:
+    """True when a player intentionally left this active room and may not re-enter."""
+    identity = _normalize_identity(identity)
+    if not room or not identity:
+        return False
+    try:
+        blocked = set(room.get("left_identities", []) or [])
+        return identity in blocked
+    except Exception:
+        return False
+
+
+def _remember_left_identity(room: dict, player_name: str, identity: str = ""):
+    """Record explicit active-game leavers so reconnect/join cannot reclaim this room."""
+    try:
+        room.setdefault("left_players", [])
+        if player_name and player_name not in room["left_players"]:
+            room["left_players"].append(player_name)
+    except Exception:
+        pass
+    try:
+        identity = _normalize_identity(identity or _seat_identity_for_player(room, player_name))
+        if identity:
+            room.setdefault("left_identities", [])
+            if identity not in room["left_identities"]:
+                room["left_identities"].append(identity)
+    except Exception:
+        pass
+
+def _find_player_by_identity(room: dict, identity: str) -> str:
+    """Return an existing non-CPU seat name for this identity in this room."""
+    identity = _normalize_identity(identity)
+    if not room or not identity:
+        return ""
+    try:
+        for pobj in room.get("players", []) or []:
+            name = pobj.get("name") or ""
+            if not name or bool(pobj.get("is_cpu")) or str(name).startswith("CPU"):
+                continue
+            if _seat_identity_for_player(room, name) == identity:
+                return name
+    except Exception:
+        pass
+    return ""
 
 
 def _unique_name_in_room(room: dict, desired: str) -> str:
@@ -353,15 +443,37 @@ def rank_of(code: str) -> int:
 
 
 def phase3_legal_uids_for_player(room: dict, player: str) -> set:
-    hand = room.get("hands", {}).get(player, [])
-    if not hand:
+    """
+    Return Phase 3 legal UIDs from the server-authoritative available cards.
+
+    Important for CPU takeover:
+    during the transition into GP3, a player's remaining cards may temporarily
+    exist in hand OR meld until global pickup has fully completed. Using hand only
+    can make a CPU-controlled disconnected/left seat select a UID that later gets
+    rejected as illegal and causes a no-progress stall.
+    """
+    hand = list(room.get("hands", {}).get(player, []) or [])
+    meld = list(room.get("melds", {}).get(player, []) or [])
+
+    available_cards = []
+    seen = set()
+    for c in hand + meld:
+        if not isinstance(c, dict):
+            continue
+        uid = c.get("uid")
+        if not uid or uid in seen:
+            continue
+        seen.add(uid)
+        available_cards.append(c)
+
+    if not available_cards:
         return set()
 
     trick = room.get("current_trick", []) or []
     trump = (room.get("trump_suit") or "").strip().lower()
 
     if len(trick) == 0:
-        return set(c["uid"] for c in hand if c.get("uid"))
+        return set(c["uid"] for c in available_cards if c.get("uid"))
 
     lead_card = trick[0].get("card") or ""
     lead_is_joker = str(lead_card).startswith("joker")
@@ -387,13 +499,13 @@ def phase3_legal_uids_for_player(room: dict, player: str) -> set:
             best_trump_rank = max(best_trump_rank, rv)
 
     lead_suit_cards = [
-        c for c in hand
+        c for c in available_cards
         if lead_suit and (suit_of(c.get("code", "")) or "").strip().lower() == lead_suit
         and not str(c.get("code", "")).startswith("joker")
     ]
 
     trump_cards = [
-        c for c in hand
+        c for c in available_cards
         if trump and (suit_of(c.get("code", "")) or "").strip().lower() == trump
         and not str(c.get("code", "")).startswith("joker")
     ]
@@ -410,11 +522,11 @@ def phase3_legal_uids_for_player(room: dict, player: str) -> set:
             else:
                 legal = set(c.get("uid") for c in trump_cards if c.get("uid"))
         else:
-            legal = set(c.get("uid") for c in hand if c.get("uid"))
+            legal = set(c.get("uid") for c in available_cards if c.get("uid"))
 
         if not legal:
-            log.error(f"[PHASE3 LEGAL EMPTY] joker_lead player={player} hand={[c.get('code') for c in hand]} trump={trump!r} trick={[t.get('card') for t in trick]}")
-            return set(c.get("uid") for c in hand if c.get("uid"))
+            log.error(f"[PHASE3 LEGAL EMPTY] joker_lead player={player} available={[c.get('code') for c in available_cards]} trump={trump!r} trick={[t.get('card') for t in trick]}")
+            return set(c.get("uid") for c in available_cards if c.get("uid"))
         return legal
 
     # MUST FOLLOW LEAD SUIT if possible.
@@ -424,27 +536,27 @@ def phase3_legal_uids_for_player(room: dict, player: str) -> set:
             over = [c for c in lead_suit_cards if rank_of(c.get("code", "")) > best_trump_rank]
             legal = set(c.get("uid") for c in (over or lead_suit_cards) if c.get("uid"))
             if not legal:
-                log.error(f"[PHASE3 LEGAL EMPTY] lead_is_trump player={player} hand={[c.get('code') for c in hand]} trump={trump!r} trick={[t.get('card') for t in trick]}")
-                return set(c.get("uid") for c in hand if c.get("uid"))
+                log.error(f"[PHASE3 LEGAL EMPTY] lead_is_trump player={player} available={[c.get('code') for c in available_cards]} trump={trump!r} trick={[t.get('card') for t in trick]}")
+                return set(c.get("uid") for c in available_cards if c.get("uid"))
             return legal
 
         # If a trump is already winning, any lead-suit card is legal.
         if any_trump_played:
             legal = set(c.get("uid") for c in lead_suit_cards if c.get("uid"))
             if not legal:
-                log.error(f"[PHASE3 LEGAL EMPTY] trump_already_winning player={player} hand={[c.get('code') for c in hand]} trump={trump!r} trick={[t.get('card') for t in trick]}")
-                return set(c.get("uid") for c in hand if c.get("uid"))
+                log.error(f"[PHASE3 LEGAL EMPTY] trump_already_winning player={player} available={[c.get('code') for c in available_cards]} trump={trump!r} trick={[t.get('card') for t in trick]}")
+                return set(c.get("uid") for c in available_cards if c.get("uid"))
             return legal
 
         # Otherwise must beat current winning lead-suit card if possible.
         over_lead = [c for c in lead_suit_cards if rank_of(c.get("code", "")) > best_lead_rank]
         legal = set(c.get("uid") for c in (over_lead or lead_suit_cards) if c.get("uid"))
         if not legal:
-            log.error(f"[PHASE3 LEGAL EMPTY] follow_lead player={player} hand={[c.get('code') for c in hand]} trump={trump!r} trick={[t.get('card') for t in trick]}")
-            return set(c.get("uid") for c in hand if c.get("uid"))
+            log.error(f"[PHASE3 LEGAL EMPTY] follow_lead player={player} available={[c.get('code') for c in available_cards]} trump={trump!r} trick={[t.get('card') for t in trick]}")
+            return set(c.get("uid") for c in available_cards if c.get("uid"))
         return legal
 
-    # NO LEAD SUIT -> MUST TRUMP / OVERTRUMP IF POSSIBLE
+    # NO LEAD SUIT -> MUST TRUMP / OVERTRUMP IF POSSIBLE.
     if trump_cards:
         if any_trump_played:
             over = [c for c in trump_cards if rank_of(c.get("code", "")) > best_trump_rank]
@@ -453,14 +565,14 @@ def phase3_legal_uids_for_player(room: dict, player: str) -> set:
             legal = set(c.get("uid") for c in trump_cards if c.get("uid"))
 
         if not legal:
-            log.error(f"[PHASE3 LEGAL EMPTY] must_trump player={player} hand={[c.get('code') for c in hand]} trump={trump!r} trick={[t.get('card') for t in trick]}")
-            return set(c.get("uid") for c in hand if c.get("uid"))
+            log.error(f"[PHASE3 LEGAL EMPTY] must_trump player={player} available={[c.get('code') for c in available_cards]} trump={trump!r} trick={[t.get('card') for t in trick]}")
+            return set(c.get("uid") for c in available_cards if c.get("uid"))
         return legal
 
-    # OTHERWISE ANY CARD
-    legal = set(c.get("uid") for c in hand if c.get("uid"))
+    # OTHERWISE ANY CARD.
+    legal = set(c.get("uid") for c in available_cards if c.get("uid"))
     if not legal:
-        log.error(f"[PHASE3 LEGAL EMPTY] fallback_any player={player} hand={[c.get('code') for c in hand]} trump={trump!r} trick={[t.get('card') for t in trick]}")
+        log.error(f"[PHASE3 LEGAL EMPTY] fallback_any player={player} available={[c.get('code') for c in available_cards]} trump={trump!r} trick={[t.get('card') for t in trick]}")
     return legal
 def phase3_determine_winner(room: dict) -> str:
     trick = room.get("current_trick", []) or []
@@ -731,6 +843,7 @@ async def _end_game_now(room_id: str, room: dict, winner_code: str, text: str, b
     room["awaiting_next_round"] = False
     room["count_required"] = False
     room["count_done"] = False
+    room["round_control_player"] = ""
 
     room["post_trick_draws"] = False
     room["draw_order"] = []
@@ -989,6 +1102,7 @@ async def start_next_round(room_id: str):
     room["awaiting_next_round"] = False
     room["count_required"] = False
     room["count_done"] = False
+    room["round_control_player"] = ""
 
     room["melds"] = {p: [] for p in players}
     room["scored_melds"] = {p: [] for p in players}
@@ -1093,6 +1207,7 @@ async def broadcast_state_without_hands(room_id: str):
 
         "count_required": room.get("count_required", False),
         "count_done": room.get("count_done", False),
+        "round_control_player": (_sync_round_control_player(room_id, room) if room.get("awaiting_next_round") else ""),
         "player_statuses": _room_statuses(room),
     }
     await _send_to_room(room_id, {"type": "state_update", "data": data})
@@ -1146,17 +1261,15 @@ async def send_state_update_to_player(room_id: str, player_name: str):
 
         "count_required": room.get("count_required", False),
         "count_done": room.get("count_done", False),
+        "round_control_player": (_sync_round_control_player(room_id, room) if room.get("awaiting_next_round") else ""),
 
         "hands": {player_name: player_hand},
         "player_statuses": _room_statuses(room),
     }
 
     if room.get("awaiting_next_round"):
-        control_name = room.get("host") or "Host"
-        if player_name == control_name:
-            data["round_end_wait_text"] = "Click Count Aces & Tens" if room.get("count_required", False) else "Click Play Next Round"
-        else:
-            data["round_end_wait_text"] = f"Waiting for {control_name} to Count Aces & Tens" if room.get("count_required", False) else f"Waiting for {control_name} to continue the game"
+        data["round_control_player"] = _sync_round_control_player(room_id, room)
+        data["round_end_wait_text"] = _round_control_wait_text(room_id, room, player_name)
 
     msg = {"type": "state_update", "data": data}
 
@@ -1187,6 +1300,7 @@ async def send_state_update_to_player(room_id: str, player_name: str):
 async def api_create_room(req: Request):
     b = await req.json()
     pn = _normalize_name(b.get("player_name"))
+    player_identity = _normalize_identity(b.get("player_identity") or b.get("identity") or "")
 
     rid = f"{pn}_Room"
     counter = 1
@@ -1198,7 +1312,7 @@ async def api_create_room(req: Request):
         "room_id": rid,
         "label": f"{pn}'s Room, 4 seats",
         "host": pn,
-        "players": [{"name": pn}],
+        "players": [{"name": pn, "identity": player_identity} if player_identity else {"name": pn}],
         "phase": "waiting",
         "deck": [],
         "melds": {pn: []},
@@ -1226,9 +1340,14 @@ async def api_create_room(req: Request):
         "count_required": False,
         "count_done": False,
         "reconnect_tokens": {},
+        "seat_identities": {},
         "player_statuses": {},
+        "round_control_player": "",
+        "left_players": [],
+        "left_identities": [],
     }
 
+    _set_seat_identity(room, pn, player_identity)
     _ensure_reconnect_token(room, pn)
     ROOMS[rid] = room
     WS_CLIENTS.setdefault(rid, [])
@@ -1264,7 +1383,8 @@ async def api_list_rooms():
     return {"rooms": rooms}
 
 
-def _create_started_practice_room_for_player(pn: str) -> dict:
+def _create_started_practice_room_for_player(pn: str, player_identity: str = "") -> dict:
+    player_identity = _normalize_identity(player_identity)
     rid = f"{pn}_Practice_Room"
     counter = 1
     while rid in ROOMS:
@@ -1276,7 +1396,7 @@ def _create_started_practice_room_for_player(pn: str) -> dict:
         "label": f"{pn}'s Practice Room",
         "host": pn,
         "players": [
-            {"name": pn},
+            {"name": pn, "identity": player_identity} if player_identity else {"name": pn},
             {"name": "CPU 1", "is_cpu": True, "controller": "cpu"},
             {"name": "CPU 2", "is_cpu": True, "controller": "cpu"},
             {"name": "CPU 3", "is_cpu": True, "controller": "cpu"},
@@ -1309,8 +1429,13 @@ def _create_started_practice_room_for_player(pn: str) -> dict:
         "cpu_difficulty": 1,
         "cpu_level": 1,
         "reconnect_tokens": {},
+        "seat_identities": {},
         "player_statuses": {},
+        "round_control_player": "",
+        "left_players": [],
+        "left_identities": [],
     }
+    _set_seat_identity(room, pn, player_identity)
     _ensure_reconnect_token(room, pn)
     ROOMS[rid] = room
     WS_CLIENTS.setdefault(rid, [])
@@ -1326,10 +1451,11 @@ async def api_join_room(req: Request):
     b = await req.json()
     rid = b.get("room_id")
     pn_req = _normalize_name(b.get("player_name"))
+    player_identity = _normalize_identity(b.get("player_identity") or b.get("identity") or "")
 
     if rid == PRACTICE_ROOM_PUBLIC_ID:
         pn = pn_req
-        room = _create_started_practice_room_for_player(pn)
+        room = _create_started_practice_room_for_player(pn, player_identity)
 
         try:
             await _start_cpu_style_game(room["room_id"], pn, cpu_level=2, cpu_scores_enabled=False)
@@ -1361,6 +1487,31 @@ async def api_join_room(req: Request):
     room.setdefault("count_required", False)
     room.setdefault("count_done", False)
     room.setdefault("reconnect_tokens", {})
+    room.setdefault("seat_identities", {})
+    room.setdefault("left_players", [])
+    room.setdefault("left_identities", [])
+
+    if _is_identity_blocked_from_room(room, player_identity):
+        return JSONResponse({"error": "left_game_no_rejoin"}, 403)
+
+    existing_identity_player = _find_player_by_identity(room, player_identity)
+    if existing_identity_player:
+        # Same Wix/member/browser identity is already seated in this room.
+        # Return that seat instead of creating a second human seat. The websocket
+        # layer will then keep the newest tab as the active connection for that seat.
+        room["ready_to_start"] = (len(room.get("players", []) or []) >= MAX_SEATS)
+        await broadcast_state_without_hands(rid)
+        await broadcast_lobby_rooms()
+        return {
+            "joined": True,
+            "already_in_room": True,
+            "same_identity": True,
+            "room_id": rid,
+            "player_name": existing_identity_player,
+            "room_label": room.get("label", rid),
+            "room_host": room.get("host", ""),
+            "reconnect_token": _ensure_reconnect_token(room, existing_identity_player)
+        }
 
     existing_names = [p.get("name") for p in room["players"] if p.get("name")]
 
@@ -1370,7 +1521,8 @@ async def api_join_room(req: Request):
 
         pn = _unique_name_in_room(room, pn_req)
 
-        room["players"].append({"name": pn})
+        room["players"].append({"name": pn, "identity": player_identity} if player_identity else {"name": pn})
+        _set_seat_identity(room, pn, player_identity)
         room["scores"][pn] = 0
         room["melds"].setdefault(pn, [])
         room["scored_melds"].setdefault(pn, [])
@@ -1392,6 +1544,9 @@ async def api_join_room(req: Request):
 
     if pn_req not in existing_names:
         return JSONResponse({"error": "game_started"}, 400)
+
+    if pn_req in (room.get("left_players", []) or []):
+        return JSONResponse({"error": "left_game_no_rejoin"}, 403)
 
     room_sockets = ROOM_SOCKETS.get(rid, {})
     active_socks = room_sockets.get(pn_req, []) or []
@@ -1446,6 +1601,9 @@ async def api_reconnect_room(req: Request):
     if not matched_player or not _player_exists_in_room(room, matched_player):
         return JSONResponse({"ok": False, "error": "invalid_reconnect_token"}, 404)
 
+    if matched_player in (room.get("left_players", []) or []):
+        return JSONResponse({"ok": False, "error": "left_game_no_rejoin"}, 403)
+
     room["ready_to_start"] = (len(room.get("players", []) or []) >= MAX_SEATS)
 
     return {
@@ -1459,6 +1617,61 @@ async def api_reconnect_room(req: Request):
     }
 
 
+@app.post("/api/reconnect_by_identity")
+async def api_reconnect_by_identity(req: Request):
+    """Restore an active seat by stable Wix/member/browser identity.
+
+    This is a fallback for cases where a player opens the game in a new tab/browser
+    and the reconnect token is not present in local storage. It does not allow
+    re-entry after an intentional active-game leave.
+    """
+    b = await req.json()
+    player_identity = _normalize_identity(b.get("player_identity") or b.get("identity") or "")
+    rid_hint = (b.get("room_id") or "").strip()
+
+    if not player_identity:
+        return JSONResponse({"ok": False, "error": "missing_identity"}, 400)
+
+    candidates = []
+    room_items = []
+    if rid_hint and rid_hint in ROOMS:
+        room_items.append((rid_hint, ROOMS[rid_hint]))
+    room_items.extend([(rid, room) for rid, room in ROOMS.items() if rid != rid_hint])
+
+    for rid, room in room_items:
+        try:
+            if room.get("phase") in (None, "", "game_over"):
+                continue
+            if _is_identity_blocked_from_room(room, player_identity):
+                continue
+            matched = _find_player_by_identity(room, player_identity)
+            if not matched or not _player_exists_in_room(room, matched):
+                continue
+            if matched in (room.get("left_players", []) or []):
+                continue
+            candidates.append((rid, room, matched))
+        except Exception:
+            continue
+
+    if not candidates:
+        return JSONResponse({"ok": False, "error": "no_active_seat_for_identity"}, 404)
+
+    rid, room, matched_player = candidates[0]
+    token = _ensure_reconnect_token(room, matched_player)
+    room["ready_to_start"] = (len(room.get("players", []) or []) >= MAX_SEATS)
+
+    return {
+        "ok": True,
+        "room_id": rid,
+        "player_name": matched_player,
+        "room_label": room.get("label", rid),
+        "room_host": room.get("host", ""),
+        "phase": room.get("phase", ""),
+        "reconnect_token": token,
+        "identity_reconnect": True
+    }
+
+
 # ---------------------------------------------------
 # LEAVE ROOM
 # ---------------------------------------------------
@@ -1467,6 +1680,8 @@ async def api_leave_room(req: Request):
     b = await req.json()
     rid = b.get("room_id")
     pn = _normalize_name(b.get("player_name"))
+    player_identity = _normalize_identity(b.get("player_identity") or b.get("identity") or "")
+    active_leave = bool(b.get("active_leave") or b.get("force_active_leave"))
 
     if not rid or rid not in ROOMS:
         return JSONResponse({"error": "room_not_found"}, 404)
@@ -1476,6 +1691,74 @@ async def api_leave_room(req: Request):
 
     if not any(p["name"] == pn for p in players):
         return JSONResponse({"error": "not_in_room"}, 400)
+
+    phase_now = room.get("phase") or ""
+
+    # Explicit active-game leave from #leaveGame2:
+    # - Keep the seat in the game so CPU takeover can control it.
+    # - Remove sockets/reconnect token so the player cannot re-enter this same room.
+    # - Return the leaving client to the lobby.
+    if phase_now not in ("", "waiting", "game_over"):
+        if not active_leave:
+            return JSONResponse({"error": "active_game_leave_requires_confirmed_active_leave"}, 400)
+
+        room.setdefault("reconnect_tokens", {})
+        room.setdefault("seat_identities", {})
+        room.setdefault("player_statuses", {})
+        room.setdefault("left_players", [])
+        room.setdefault("left_identities", [])
+
+        if player_identity:
+            _set_seat_identity(room, pn, player_identity)
+        _remember_left_identity(room, pn, player_identity)
+
+        room_sockets = ROOM_SOCKETS.get(rid, {})
+        personal_sockets = room_sockets.pop(pn, [])
+        for sock in list(personal_sockets):
+            try:
+                _safe_remove_ws(rid, pn, sock)
+            except Exception:
+                pass
+            try:
+                await sock.close()
+            except Exception:
+                pass
+        ROOM_SOCKETS[rid] = room_sockets
+
+        try:
+            room.get("reconnect_tokens", {}).pop(pn, None)
+        except Exception:
+            pass
+
+        try:
+            _mark_human_disconnected(rid, pn)
+            if _activate_cpu_takeover(rid, pn):
+                # Explicit Leave Game / Room Info leave is intentional, not accidental.
+                # Do not wait through the reconnect-grace slow CPU-turn window.
+                st = _room_statuses(room).setdefault(pn, {})
+                st["intentional_active_leave"] = True
+                st["cpu_takeover_started_at"] = time.monotonic() - CPU_TAKEOVER_SLOW_WINDOW_SECONDS - 1.0
+        except Exception:
+            pass
+
+        if room.get("awaiting_next_round"):
+            _sync_round_control_player(rid, room)
+
+        await broadcast_state_without_hands(rid)
+        for p in _players_order(room):
+            await send_state_update_to_player(rid, p)
+        await broadcast_lobby_rooms()
+        await cpu_maybe_act(rid)
+
+        return {
+            "left": True,
+            "active_leave": True,
+            "room_id": rid,
+            "room_deleted": False,
+            "player_name": pn,
+            "cpu_takeover": True,
+            "cannot_rejoin": True,
+        }
 
     if room["phase"] == "waiting" and room["host"] == pn and len(players) > 1:
         return JSONResponse({"error": "host_cannot_leave_with_players"}, 400)
@@ -1492,17 +1775,21 @@ async def api_leave_room(req: Request):
         room.get("reconnect_tokens", {}).pop(pn, None)
     except Exception:
         pass
+    try:
+        room.get("seat_identities", {}).pop(pn, None)
+    except Exception:
+        pass
 
     room_sockets = ROOM_SOCKETS.get(rid, {})
     personal_sockets = room_sockets.pop(pn, [])
     for sock in list(personal_sockets):
         try:
             _safe_remove_ws(rid, pn, sock)
-        except:
+        except Exception:
             pass
         try:
             await sock.close()
-        except:
+        except Exception:
             pass
 
     ROOM_SOCKETS[rid] = room_sockets
@@ -1601,6 +1888,68 @@ def _seat_has_active_socket(room_id: str, player_name: str) -> bool:
         return False
 
 
+def _connected_humans_in_order(room_id: str, room: dict) -> List[str]:
+    """Connected, non-CPU seats in table order."""
+    out = []
+    try:
+        for p in room.get("players", []) or []:
+            name = p.get("name")
+            if not name or _is_cpu(room, name):
+                continue
+            if _seat_has_active_socket(room_id, name):
+                out.append(name)
+    except Exception:
+        pass
+    return out
+
+
+def _resolve_round_control_player(room_id: str, room: dict) -> str:
+    """Choose who may click Count Aces & Tens / Play Next Round.
+
+    Default: host if connected.
+    If host is disconnected or under CPU takeover, delegate to the next connected
+    human in seating order. If no human is connected, return empty string so the
+    round pauses until a human reconnects. Applies to Practice Room, mixed CPU,
+    and all-human games.
+    """
+    connected = _connected_humans_in_order(room_id, room)
+    if not connected:
+        return ""
+
+    current = room.get("round_control_player") or ""
+    if current in connected:
+        return current
+
+    host = room.get("host") or ""
+    if host in connected:
+        return host
+
+    order = _players_order(room)
+    if host in order:
+        hidx = order.index(host)
+        for offset in range(1, len(order) + 1):
+            cand = order[(hidx + offset) % len(order)]
+            if cand in connected:
+                return cand
+
+    return connected[0]
+
+
+def _sync_round_control_player(room_id: str, room: dict) -> str:
+    control = _resolve_round_control_player(room_id, room)
+    room["round_control_player"] = control
+    return control
+
+
+def _round_control_wait_text(room_id: str, room: dict, viewer: str) -> str:
+    control = _sync_round_control_player(room_id, room)
+    if not control:
+        return "Waiting for a human player to reconnect."
+    if viewer == control:
+        return "Click Count Aces & Tens" if room.get("count_required", False) else "Click Play Next Round"
+    return f"Waiting for {control} to Count Aces & Tens" if room.get("count_required", False) else f"Waiting for {control} to Play Next Round"
+
+
 def _mark_human_connected(room_id: str, player_name: str):
     room = ROOMS.get(room_id)
     if not room or _is_cpu(room, player_name):
@@ -1659,6 +2008,8 @@ def _cpu_takeover_delay_for_turn(room: dict, player_name: str) -> Optional[float
         st = _room_statuses(room).get(player_name, {})
         if not st.get("cpu_takeover_active"):
             return None
+        if st.get("intentional_active_leave"):
+            return None
         started = float(st.get("cpu_takeover_started_at") or time.monotonic())
         if (time.monotonic() - started) < CPU_TAKEOVER_SLOW_WINDOW_SECONDS:
             return CPU_TAKEOVER_SLOW_TURN_SECONDS
@@ -1714,7 +2065,7 @@ def _choose_cpu_play_uid(room: dict, cpu_name: str):
 
 def _cpu_room_level(room: dict) -> int:
     try:
-        return int(room.get("cpu_difficulty", room.get("cpu_level", 1)) or 1)
+        return int(room.get("cpu_difficulty", room.get("cpu_level", 2)) or 2)
     except Exception:
         return 1
 
@@ -2007,7 +2358,9 @@ def _cpu_choose_play_uid_level2(room: dict, cpu_name: str):
 
     if phase == "phase3":
         legal_uids = phase3_legal_uids_for_player(room, cpu_name)
-        legal_cards = [c for c in combined if c.get("uid") in legal_uids] or combined[:]
+        legal_cards = [c for c in combined if c.get("uid") in legal_uids]
+        if not legal_cards:
+            return None
     else:
         legal_cards = combined[:]
 
@@ -2023,6 +2376,80 @@ def _cpu_choose_play_uid_level2(room: dict, cpu_name: str):
     candidates = unprotected if unprotected else legal_cards
     candidates = sorted(candidates, key=lambda c: (_rank_value(c.get("code","")), c.get("code","")))
     return (candidates[0] or {}).get("uid") if candidates else None
+
+
+
+def _cpu_choose_phase3_legal_fallback_uid(room: dict, player_name: str):
+    """Return the cheapest server-legal Phase 3 UID from hand+meld.
+
+    Used only as a safety net for CPU takeover seats, so a rejected illegal
+    fallback card cannot stop GP3 progression.
+    """
+    try:
+        combined = list(room.get("hands", {}).get(player_name, []) or []) + list(room.get("melds", {}).get(player_name, []) or [])
+        if not combined:
+            return None
+        legal = phase3_legal_uids_for_player(room, player_name)
+        legal_cards = [c for c in combined if c.get("uid") in legal]
+        if not legal_cards:
+            # If there is exactly one physical card left for this player, allow it.
+            # The normal play pipeline will still remove it safely.
+            if _count_total_cards_for_player(room, player_name) == 1:
+                return (combined[0] or {}).get("uid")
+            return None
+        legal_cards = sorted(legal_cards, key=lambda c: (_rank_value(c.get("code", "")), c.get("code", "")))
+        return (legal_cards[0] or {}).get("uid")
+    except Exception as e:
+        log.exception(f"[CPU PHASE3 FALLBACK ERROR] player={player_name} err={e}")
+        return None
+
+
+
+def _cpu_choose_phase3_legal_fallback_uid(room: dict, player_name: str):
+    """Return the cheapest server-legal GP3 UID from hand+meld.
+
+    Safety net for CPU takeover seats. It avoids the old behavior where fallback
+    blindly picked the lowest hand card, which could be illegal in GP3 and leave
+    the game stopped on "CPU is currently playing for ...".
+    """
+    try:
+        combined = list(room.get("hands", {}).get(player_name, []) or []) + list(room.get("melds", {}).get(player_name, []) or [])
+        seen = set()
+        cards = []
+        for c in combined:
+            if not isinstance(c, dict):
+                continue
+            uid = c.get("uid")
+            if not uid or uid in seen:
+                continue
+            seen.add(uid)
+            cards.append(c)
+
+        if not cards:
+            return None
+
+        legal = phase3_legal_uids_for_player(room, player_name)
+        legal_cards = [c for c in cards if c.get("uid") in legal]
+
+        if not legal_cards:
+            # Last physical card is always forced; normal process_action removal still protects state.
+            if _count_total_cards_for_player(room, player_name) == 1:
+                return (cards[0] or {}).get("uid")
+            log.info(
+                f"[CPU PHASE3 NO LEGAL FALLBACK] player={player_name} "
+                f"hand={[c.get('code') for c in (room.get('hands', {}).get(player_name) or [])]} "
+                f"meld={[c.get('code') for c in (room.get('melds', {}).get(player_name) or [])]} "
+                f"trick={[t.get('card') for t in (room.get('current_trick', []) or [])]} "
+                f"trump={room.get('trump_suit')!r}"
+            )
+            return None
+
+        legal_cards = sorted(legal_cards, key=lambda c: (_rank_value(c.get("code", "")), c.get("code", "")))
+        return (legal_cards[0] or {}).get("uid")
+    except Exception as e:
+        log.exception(f"[CPU PHASE3 FALLBACK ERROR] player={player_name} err={e}")
+        return None
+
 
 async def _cpu_try_score_now(room_id: str, player_name: str) -> bool:
     _cpu_score_t0 = time.monotonic()
@@ -2102,6 +2529,15 @@ async def _cpu_try_score_now(room_id: str, player_name: str) -> bool:
 
 class _NoopWS:
     async def send_json(self, *args, **kwargs):
+        # CPU/server actions use this dummy websocket. Log info/error responses
+        # so no-progress stalls reveal whether the action was illegal, missing UID, etc.
+        try:
+            if args:
+                msg = args[0]
+                if isinstance(msg, dict) and msg.get("type") in ("info", "error"):
+                    log.info(f"[CPU DUMMY WS] {msg}")
+        except Exception:
+            pass
         return
 
 _DUMMY_WS = _NoopWS()
@@ -2211,7 +2647,10 @@ async def cpu_maybe_act(room_id: str):
                         uid = None
 
                     if not uid:
-                        uid = _choose_cpu_play_uid(r2, cur)
+                        if phase == "phase3":
+                            uid = _cpu_choose_phase3_legal_fallback_uid(r2, cur)
+                        else:
+                            uid = _choose_cpu_play_uid(r2, cur)
 
                     if not uid:
                         hand = (r2.get("hands", {}).get(cur) or [])
@@ -2233,7 +2672,7 @@ async def cpu_maybe_act(room_id: str):
                     after_trick_len = len(r_after.get("current_trick", []) or [])
 
                     if after_turn == before_turn and after_trick_len == before_trick_len:
-                        fallback_uid = _choose_cpu_play_uid(r_after, cur)
+                        fallback_uid = _cpu_choose_phase3_legal_fallback_uid(r_after, cur) if phase == "phase3" else _choose_cpu_play_uid(r_after, cur)
 
                         if fallback_uid and fallback_uid != uid:
                             log.info(f"[CPU ACTION] room={room_id} player={cur} action=play_card_fallback uid={fallback_uid}")
@@ -2245,7 +2684,14 @@ async def cpu_maybe_act(room_id: str):
                             await asyncio.sleep(0)
                             continue
 
-                        log.info(f"[CPU RUNNER BREAK] room={room_id} reason=no_progress phase={phase} player={cur} steps={steps}")
+                        try:
+                            legal_dbg = list(phase3_legal_uids_for_player(r_after, cur)) if phase == "phase3" else []
+                            hand_dbg = [c.get("code") for c in (r_after.get("hands", {}).get(cur) or [])]
+                            meld_dbg = [c.get("code") for c in (r_after.get("melds", {}).get(cur) or [])]
+                            trick_dbg = [t.get("card") for t in (r_after.get("current_trick", []) or [])]
+                            log.info(f"[CPU RUNNER BREAK] room={room_id} reason=no_progress phase={phase} player={cur} steps={steps} legal={legal_dbg} hand={hand_dbg} meld={meld_dbg} trick={trick_dbg} phase3_picked={r_after.get('phase3_melds_picked')}")
+                        except Exception:
+                            log.info(f"[CPU RUNNER BREAK] room={room_id} reason=no_progress phase={phase} player={cur} steps={steps}")
                         break
 
 
@@ -2258,18 +2704,6 @@ async def cpu_maybe_act(room_id: str):
             r3 = ROOMS.get(room_id)
             if r3 is not None:
                 r3["_cpu_running"] = False
-                # v82.4: If the 50-step safety cap ends while the next turn is still
-                # CPU-controlled, immediately wake a fresh runner. This preserves the
-                # safety cap without leaving the game stuck on a CPU/takeover turn
-                # after reconnect/takeover has advanced many actions.
-                try:
-                    cur3 = r3.get("current_turn")
-                    phase3_now = (r3.get("phase") or "").strip()
-                    if steps >= 50 and cur3 and phase3_now not in ("", "waiting", "game_over") and _is_cpu_controlled(r3, cur3):
-                        log.info(f"[CPU RUNNER CONTINUE] room={room_id} reason=step_cap current_turn={cur3!r}")
-                        asyncio.create_task(cpu_maybe_act(room_id))
-                except Exception:
-                    pass
 
     asyncio.create_task(_runner())
 
@@ -2294,6 +2728,7 @@ async def _start_cpu_style_game(room_id: str, host_name: str, cpu_level: int = 2
     room['awaiting_next_round'] = False
     room['count_required'] = False
     room['count_done'] = False
+    room['round_control_player'] = ""
 
     await broadcast_state_without_hands(room_id)
 
@@ -2400,6 +2835,7 @@ async def api_start_game(req: Request):
     room["awaiting_next_round"] = False
     room["count_required"] = False
     room["count_done"] = False
+    room["round_control_player"] = ""
 
     await broadcast_state_without_hands(rid)
 
@@ -2422,6 +2858,13 @@ async def api_start_game(req: Request):
     room["meld_scored_this_trick"] = False
     room["phase3_melds_picked"] = False
     room["ready_to_start"] = True
+
+    # All-human rooms may later need CPU takeover for disconnected/left human seats.
+    # Treat takeover seats like Easy CPU players for meld scoring, while no actual
+    # CPU seats exist until a human disconnects or intentionally leaves.
+    room["cpu_difficulty"] = 2
+    room["cpu_level"] = 2
+    room["cpu_scores_enabled"] = True
 
     room["won_tricks"] = {}
     room["_won_trick_sigs"] = set()
@@ -2464,12 +2907,19 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
         return
 
     # ============================================================
-    # ROUND END WAIT: Host must Count A/10 first, then Continue next round
+    # ROUND END WAIT: connected human control must Count A/10 first, then Continue next round
     # ============================================================
     if room.get("awaiting_next_round"):
+        control_player = _sync_round_control_player(room_id, room)
         if action == "count_aces_tens":
-            if player != room.get("host"):
-                await ws.send_json({"type": "info", "msg": "only_host_can_count"})
+            if not control_player:
+                await ws.send_json({"type": "info", "msg": "waiting_for_human_reconnect"})
+                await broadcast_state_without_hands(room_id)
+                for p in _players_order(room):
+                    await send_state_update_to_player(room_id, p)
+                return
+            if player != control_player:
+                await ws.send_json({"type": "info", "msg": "only_round_control_can_count", "round_control_player": control_player})
                 return
             if not room.get("count_required", False):
                 await ws.send_json({"type": "info", "msg": "count_not_required"})
@@ -2512,7 +2962,8 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
                 "bonus": bonus,
                 "scores": room.get("scores", {}),
                 "msg": "Aces and 10s counted.",
-                "play_score_any": True
+                "play_score_any": True,
+                "round_control_player": room.get("round_control_player", "")
             })
 
             # ✅ standardized "no winner" text
@@ -2522,10 +2973,12 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
                 "text": NO_WINNER_TEXT,
                 "scores": room.get("scores", {}),
                 "last_trick_winner": room.get("last_trick_winner"),
-                "bonus": bonus
+                "bonus": bonus,
+                "round_control_player": room.get("round_control_player", "")
             })
 
             room["phase"] = "round_end_wait"
+            _sync_round_control_player(room_id, room)
 
             await broadcast_state_without_hands(room_id)
             for p in _players_order(room):
@@ -2533,8 +2986,15 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
             return
 
         if action == "next_round":
-            if player != room.get("host"):
-                await ws.send_json({"type": "info", "msg": "only_host_can_start_next_round"})
+            control_player = _sync_round_control_player(room_id, room)
+            if not control_player:
+                await ws.send_json({"type": "info", "msg": "waiting_for_human_reconnect"})
+                await broadcast_state_without_hands(room_id)
+                for p in _players_order(room):
+                    await send_state_update_to_player(room_id, p)
+                return
+            if player != control_player:
+                await ws.send_json({"type": "info", "msg": "only_round_control_can_start_next_round", "round_control_player": control_player})
                 return
             if room.get("count_required", False) and not room.get("count_done", False):
                 await ws.send_json({"type": "info", "msg": "must_count_aces_tens_first"})
@@ -2737,11 +3197,13 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
                     room["phase"] = "round_end_wait"
                     room["count_required"] = True
                     room["count_done"] = False
+                    control_player = _sync_round_control_player(room_id, room)
 
                     await _send_to_room(room_id, {
                         "type": "round_end_wait",
-                        "msg": "No winner yet. Host must click Count All Aces and 10s.",
+                        "msg": ("No winner yet. Count Aces and 10s." if control_player else "No winner yet. Waiting for a human player to reconnect."),
                         "host": room.get("host"),
+                        "round_control_player": control_player,
                     })
 
                     await _send_to_room(room_id, {
@@ -2750,7 +3212,8 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
                         "text": NO_WINNER_TEXT,
                         "scores": room.get("scores", {}),
                         "last_trick_winner": room.get("last_trick_winner"),
-                        "bonus": {}
+                        "bonus": {},
+                        "round_control_player": room.get("round_control_player", "")
                     })
 
                     await broadcast_state_without_hands(room_id)
@@ -3553,6 +4016,16 @@ async def websocket_endpoint(
 
     name_exists = any(p["name"] == player_name for p in room.get("players", []))
 
+    if player_name in (room.get("left_players", []) or []):
+        await ws.send_json({"type": "error", "error": "left_game_no_rejoin"})
+        await ws.close()
+        return
+
+    if (not name_exists) and room.get("phase") not in ("waiting", ""):
+        await ws.send_json({"type": "error", "error": "game_started"})
+        await ws.close()
+        return
+
     if (not name_exists) and room.get("phase") == "waiting" and len(room.get("players", [])) >= MAX_SEATS:
         await ws.send_json({"type": "error", "error": "room_full"})
         await ws.close()
@@ -3572,21 +4045,10 @@ async def websocket_endpoint(
 
     await _register_single_socket(room_id, player_name, ws)
     _mark_human_connected(room_id, player_name)
+    if room.get("awaiting_next_round"):
+        _sync_round_control_player(room_id, room)
     await send_state_update_to_player(room_id, player_name)
     await broadcast_state_without_hands(room_id)
-
-    # v82.4: A reconnect can happen after a CPU runner hit its safety cap,
-    # leaving current_turn on a CPU seat. Opening/reopening a websocket should
-    # nudge the runner if the current turn is CPU-controlled. This does not
-    # affect a reclaimed human turn because _mark_human_connected() clears
-    # takeover for that human before this check.
-    try:
-        cur_on_open = room.get("current_turn")
-        if cur_on_open and room.get("phase") not in (None, "", "waiting", "game_over") and _is_cpu_controlled(room, cur_on_open):
-            log.info(f"[CPU RUNNER WAKE] room={room_id} reason=ws_open current_turn={cur_on_open!r}")
-            await cpu_maybe_act(room_id)
-    except Exception:
-        pass
 
     try:
         while True:
@@ -3601,6 +4063,8 @@ async def websocket_endpoint(
                 remaining = ROOM_SOCKETS.get(room_id, {}).get(player_name, []) or []
                 if not remaining and not _is_cpu(room, player_name):
                     _mark_human_disconnected(room_id, player_name)
+                    if room.get("awaiting_next_round"):
+                        _sync_round_control_player(room_id, room)
                     await broadcast_state_without_hands(room_id)
                     asyncio.create_task(_cpu_takeover_after_grace(room_id, player_name))
             if room and room.get("phase") == "waiting":
@@ -3636,6 +4100,8 @@ async def websocket_endpoint(
                 remaining = ROOM_SOCKETS.get(room_id, {}).get(player_name, []) or []
                 if not remaining and not _is_cpu(room, player_name):
                     _mark_human_disconnected(room_id, player_name)
+                    if room.get("awaiting_next_round"):
+                        _sync_round_control_player(room_id, room)
                     await broadcast_state_without_hands(room_id)
                     asyncio.create_task(_cpu_takeover_after_grace(room_id, player_name))
             if room and room.get("phase") == "waiting":
