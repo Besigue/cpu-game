@@ -1,5 +1,5 @@
 # ============================
-# main.py — Besigue Server (v82.4.7a-GP3-CPU-TAKEOVER-FIX)
+# main.py — Besigue Server (v82.4.9c-TRUMP7-PAUSE-COUNT-SOUND)
 #
 # Based on your pasted v76.8 (NO rewrites / no new files).
 #
@@ -30,7 +30,7 @@ from itertools import combinations
 
 log = logging.getLogger("besigue")
 logging.basicConfig(level=logging.INFO)
-log.info("BOOT main.py v82.4.7a GP3_CPU_TAKEOVER_FIX loaded")
+log.info("BOOT main.py v82.4.9b TEST_TRUMP_SEVEN_SCORE loaded")
 
 app = FastAPI()
 
@@ -899,6 +899,57 @@ async def _check_instant_win(room_id: str, room: dict) -> bool:
 
 
 
+
+async def _award_trump_seven_if_applicable(room_id: str, room: dict, player: str, card_code: str) -> bool:
+    """Award +10 immediately when a player legally plays the 7 of trump.
+
+    Returns True if this scoring event ended the game.
+    This is intentionally server-authoritative and runs after the card has already
+    passed normal play legality and has been added to current_trick.
+    """
+    try:
+        trump = (room.get("trump_suit") or "").strip().lower()
+        if not trump or not card_code or str(card_code).startswith("joker"):
+            return False
+        if rank_of(card_code) != rank_value_map.get("7"):
+            return False
+        if (suit_of(card_code) or "").strip().lower() != trump:
+            return False
+
+        room.setdefault("scores", {})
+        try:
+            before = int(room["scores"].get(player, 0) or 0)
+        except Exception:
+            before = 0
+        room["scores"][player] = before + 10
+
+        log.info(f"[TRUMP SEVEN SCORE] room={room_id} player={player} card={card_code} trump={trump} +10 score={room['scores'].get(player)}")
+
+        # Give every browser time to show the trump 7 and hear the alert before
+        # another CPU-controlled player immediately covers the next trick slot.
+        # Human turns are not delayed; the CPU runner checks this timestamp before
+        # continuing automated play.
+        room["_pause_after_trump_seven_until"] = time.monotonic() + 2.0
+
+        await _send_to_room(room_id, {
+            "type": "trump_seven_scored",
+            "player": player,
+            "card": card_code,
+            "points": 10,
+            "scores": room.get("scores", {}),
+            "play_turn_alert": True,
+            "msg": f"{player} scored 10 points for playing the 7 of trump."
+        })
+
+        # If this immediate bonus reaches the winning score, let the scoring/alert
+        # sound happen first; _end_game_now already includes a short delay before
+        # show_winner / game_over.
+        return await _check_instant_win(room_id, room)
+    except Exception as e:
+        log.exception(f"[TRUMP SEVEN SCORE ERROR] room={room_id} player={player} card={card_code} err={e}")
+        return False
+
+
 async def _schedule_phase3_auto_pickup(room_id: str, delay_seconds: float = 6.0):
     """After Phase 3 starts, auto-pickup melds after a short pause.
     This covers the case where the leader is a HUMAN and no one clicks a meld card,
@@ -1082,6 +1133,7 @@ async def start_next_round(room_id: str):
     room["lead"] = next_start
     room["current_turn"] = next_start
     room["phase"] = "phase1"
+    room["_opening_cpu_lead_delay_pending"] = bool(_is_cpu_controlled(room, next_start) or _is_cpu(room, next_start))
 
     room["deck"] = new_deck_full_132()
     room["hands"] = deal_cards_to_players(room, 9)
@@ -2587,22 +2639,62 @@ async def cpu_maybe_act(room_id: str):
                     f"deck={len(r2.get('deck', []) or [])}"
                 )
 
-                # CPU delay. For CPU takeover seats, pause before each action during the reclaim window.
-                takeover_delay = _cpu_takeover_delay_for_turn(r2, cur)
-                if takeover_delay is not None:
-                    await asyncio.sleep(takeover_delay)
-                    r2_after_wait = ROOMS.get(room_id) or {}
-                    if r2_after_wait.get("current_turn") != cur or not _is_cpu_controlled(r2_after_wait, cur):
-                        log.info(f"[CPU RUNNER BREAK] room={room_id} reason=takeover_reclaimed_or_turn_changed phase={phase} current_turn={cur!r} steps={steps}")
-                        break
-                elif room.get("phase") == "phase3":
-                    # After a trick completes, keep the last trick visible a bit before the winning CPU leads.
-                    if room.get("pending_trick_clear") and _is_cpu_controlled(room, room.get("current_turn")):
-                        await asyncio.sleep(3.0)
-                    else:
-                        await asyncio.sleep(2.0)
+                # If a 7 of trump was just scored and automated CPU play is about to continue,
+                # pause briefly so the played card and turn-alert sound are visible/audible.
+                try:
+                    trump7_until = float(r2.get("_pause_after_trump_seven_until") or 0.0)
+                except Exception:
+                    trump7_until = 0.0
+                if trump7_until > time.monotonic():
+                    pause_for = max(0.0, trump7_until - time.monotonic())
+                    log.info(f"[CPU TRUMP7 PAUSE] room={room_id} player={cur} seconds={pause_for:.2f}")
+                    await asyncio.sleep(pause_for)
+                    r2 = ROOMS.get(room_id) or r2
+                    if r2.get("current_turn") != cur:
+                        # A human/other action advanced the game while waiting. Re-evaluate loop.
+                        await asyncio.sleep(0)
+                        continue
+                try:
+                    if float((ROOMS.get(room_id) or {}).get("_pause_after_trump_seven_until") or 0.0) <= time.monotonic():
+                        (ROOMS.get(room_id) or {}).pop("_pause_after_trump_seven_until", None)
+                except Exception:
+                    pass
+
+                # CPU delay. If a CPU is selected to lead the first trick of any round,
+                # give humans a short moment to see their newly dealt cards first.
+                opening_cpu_lead_delay = False
+                try:
+                    opening_cpu_lead_delay = bool(
+                        r2.get("_opening_cpu_lead_delay_pending")
+                        and phase == "phase1"
+                        and len(r2.get("current_trick", []) or []) == 0
+                        and not r2.get("post_trick_draws")
+                        and r2.get("current_turn") == cur
+                    )
+                except Exception:
+                    opening_cpu_lead_delay = False
+
+                if opening_cpu_lead_delay:
+                    r2["_opening_cpu_lead_delay_pending"] = False
+                    log.info(f"[CPU OPENING LEAD DELAY] room={room_id} player={cur} seconds=2.75")
+                    await asyncio.sleep(2.75)
                 else:
-                    await asyncio.sleep(random.uniform(*CPU_NORMAL_DELAY_RANGE))
+                    # For CPU takeover seats, pause before each action during the reclaim window.
+                    takeover_delay = _cpu_takeover_delay_for_turn(r2, cur)
+                    if takeover_delay is not None:
+                        await asyncio.sleep(takeover_delay)
+                        r2_after_wait = ROOMS.get(room_id) or {}
+                        if r2_after_wait.get("current_turn") != cur or not _is_cpu_controlled(r2_after_wait, cur):
+                            log.info(f"[CPU RUNNER BREAK] room={room_id} reason=takeover_reclaimed_or_turn_changed phase={phase} current_turn={cur!r} steps={steps}")
+                            break
+                    elif room.get("phase") == "phase3":
+                        # After a trick completes, keep the last trick visible a bit before the winning CPU leads.
+                        if room.get("pending_trick_clear") and _is_cpu_controlled(room, room.get("current_turn")):
+                            await asyncio.sleep(3.0)
+                        else:
+                            await asyncio.sleep(2.0)
+                    else:
+                        await asyncio.sleep(random.uniform(*CPU_NORMAL_DELAY_RANGE))
 
                 # ------------------------------------------------------------
                 # CPU ACTION CHOICE
@@ -2724,6 +2816,7 @@ async def _start_cpu_style_game(room_id: str, host_name: str, cpu_level: int = 2
     room['current_turn'] = lead
     room['phase'] = 'lead_selection'
     room['round_start_lead'] = lead
+    room['_opening_cpu_lead_delay_pending'] = bool(_is_cpu_controlled(room, lead) or _is_cpu(room, lead))
 
     room['awaiting_next_round'] = False
     room['count_required'] = False
@@ -2831,6 +2924,7 @@ async def api_start_game(req: Request):
     room["phase"] = "lead_selection"
 
     room["round_start_lead"] = lead
+    room["_opening_cpu_lead_delay_pending"] = bool(_is_cpu_controlled(room, lead) or _is_cpu(room, lead))
 
     room["awaiting_next_round"] = False
     room["count_required"] = False
@@ -2951,12 +3045,9 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
             room["pending_trick_clear"] = False
             await _send_to_room(room_id, {"type": "clear_trick"})
 
-            # ✅ IMPORTANT: if bonus pushed someone to 400+, end game NOW.
-            winner_code, text = _evaluate_winner_after_round(room)
-            if winner_code and winner_code != "":
-                await _end_game_now(room_id, room, winner_code, text, bonus=bonus)
-                return
-
+            # Count Aces & Tens is always a scoring event. Broadcast it before any
+            # winner/game-over message so every browser can play SCORE_ANY and update
+            # scores first.
             await _send_to_room(room_id, {
                 "type": "aces_tens_counted",
                 "bonus": bonus,
@@ -2965,6 +3056,14 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
                 "play_score_any": True,
                 "round_control_player": room.get("round_control_player", "")
             })
+
+            # ✅ IMPORTANT: if bonus pushed someone to 400+, end game AFTER the
+            # score-any event has had a short lead.
+            winner_code, text = _evaluate_winner_after_round(room)
+            if winner_code and winner_code != "":
+                await asyncio.sleep(1.25)
+                await _end_game_now(room_id, room, winner_code, text, bonus=bonus)
+                return
 
             # ✅ standardized "no winner" text
             await _send_to_room(room_id, {
@@ -3116,6 +3215,11 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
 
         await send_state_update_to_player(room_id, player)
         await broadcast_state_without_hands(room_id)
+
+        # Trump 7 rule: after a legal play is visible, award +10 immediately.
+        # If this reaches the winning score, the game ends after the alert sound lead.
+        if await _award_trump_seven_if_applicable(room_id, room, player, card_code):
+            return
 
         # ============================================================
         # PHASE 3 LAST-TRICK AUTO-PLAY
