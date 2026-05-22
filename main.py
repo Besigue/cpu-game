@@ -1,5 +1,5 @@
 # ============================
-# main.py — Besigue Server (v82.4.9c-TRUMP7-PAUSE-COUNT-SOUND)
+# main.py — Besigue Server (v82.4.10b-CPU-RUNNER-RESTART)
 #
 # Based on your pasted v76.8 (NO rewrites / no new files).
 #
@@ -30,7 +30,7 @@ from itertools import combinations
 
 log = logging.getLogger("besigue")
 logging.basicConfig(level=logging.INFO)
-log.info("BOOT main.py v82.4.9b TEST_TRUMP_SEVEN_SCORE loaded")
+log.info("BOOT main.py v82.4.10b CPU_RUNNER_RESTART loaded")
 
 app = FastAPI()
 
@@ -2796,6 +2796,27 @@ async def cpu_maybe_act(room_id: str):
             r3 = ROOMS.get(room_id)
             if r3 is not None:
                 r3["_cpu_running"] = False
+
+                # v82.4.10b:
+                # If a human reconnects/reclaims a seat while an old CPU-takeover
+                # runner is sleeping, the runner can wake, detect the reclaim, and
+                # exit after that human has already played a card. In that sequence,
+                # the current turn may now belong to a normal CPU seat, but the
+                # process_action-triggered cpu_maybe_act() call was skipped because
+                # _cpu_running was still True. Restart the runner once after release.
+                try:
+                    phase_now = (r3.get("phase") or "").strip()
+                    turn_now = r3.get("current_turn")
+                    if (
+                        phase_now not in ("", "waiting", "game_over", "round_end_wait")
+                        and turn_now
+                        and _is_cpu_controlled(r3, turn_now)
+                        and not r3.get("awaiting_next_round")
+                    ):
+                        log.info(f"[CPU RUNNER RESTART NEEDED] room={room_id} phase={phase_now} current_turn={turn_now}")
+                        asyncio.create_task(cpu_maybe_act(room_id))
+                except Exception as e:
+                    log.exception(f"[CPU RUNNER RESTART CHECK ERROR] room={room_id} err={e}")
 
     asyncio.create_task(_runner())
 
