@@ -35,7 +35,6 @@ log.info("BOOT main.py v82.4.10b CPU_RUNNER_RESTART loaded")
 app = FastAPI()
 
 
-
 # Basic health check for Render / uptime probes
 @app.get("/")
 async def root_health():
@@ -78,7 +77,13 @@ rank_value_map = {
 SUITS = ["hearts", "diamonds", "clubs", "spades"]
 
 MAX_SEATS = 4
-WINNING_SCORE = 400
+DEFAULT_WINNING_SCORE = 400
+
+def room_winning_score(room):
+    try:
+        return int(room.get("winning_score", DEFAULT_WINNING_SCORE))
+    except:
+        return DEFAULT_WINNING_SCORE
 FINAL_TRICK_ROUND_END_DELAY = 3.0
 POST_SCORE_SHOWWINNER_DELAY = 2.5
 FINAL_TRICK_ROUND_END_DELAY_SAFE = globals().get("FINAL_TRICK_ROUND_END_DELAY", 3.0)
@@ -86,7 +91,7 @@ ORDERED_TEST_DECK_ENABLED = False  # ordered test deck disabled after quinte ver
 
 NO_WINNER_TEXT = "No Winner Yet, Let's Keep Going!"
 PRACTICE_ROOM_PUBLIC_ID = "practice_room_1"
-PRACTICE_ROOM_PUBLIC_LABEL = "Practice Room 1, 1 seat"
+PRACTICE_ROOM_PUBLIC_LABEL = "Practice Room, 400 Points, 1 Seat"
 
 # Actions that should be blocked once game_over
 GAMEPLAY_ACTIONS = (
@@ -385,10 +390,11 @@ async def _emit_deck_count(room_id: str, deck_count: int):
 async def broadcast_lobby_rooms():
     rooms = []
     for r in ROOMS.values():
-        if r.get("phase") == "waiting":
+        if r.get("phase") == "waiting" and r.get("is_open", False):
+            display_label = f"{r.get('host', 'Host')}\'s Room, {room_winning_score(r)} Points, {len(r.get('players', []))}/4 Seated"
             rooms.append({
                 "room_id": r["room_id"],
-                "label": r["label"],
+                "label": display_label,
                 "players": len(r.get("players", []))
             })
     for _rid, clients in WS_CLIENTS.items():
@@ -817,12 +823,20 @@ def _evaluate_winner_after_round(room: dict) -> Tuple[str, str]:
             scores[k] = 0
 
     max_score = max(scores.values()) if scores else 0
-    if max_score < WINNING_SCORE:
+    target_score = room_winning_score(room)
+
+    log.info(
+        f"[WIN CHECK] target={target_score} scores={room.get('scores', {})}"
+    )
+    if max_score < target_score:
         return "", NO_WINNER_TEXT
 
     tied = [p for p, s in scores.items() if s == max_score]
     if len(tied) == 1:
         w = tied[0]
+        log.info(
+            f"[WINNER FOUND] winner={w} max_score={max_score} target={target_score}"
+        )
         return w, _format_winner_text(room, w)
 
     last = room.get("last_trick_winner") or ""
@@ -838,6 +852,10 @@ async def _end_game_now(room_id: str, room: dict, winner_code: str, text: str, b
     Keeps existing show_winner UI contract.
     """
     order = _players_order(room)
+
+    log.info(
+        f"[GAME OVER] winner={winner_code} target={room_winning_score(room)} scores={room.get('scores', {})}"
+    )
 
     room["phase"] = "game_over"
     room["awaiting_next_round"] = False
@@ -857,6 +875,8 @@ async def _end_game_now(room_id: str, room: dict, winner_code: str, text: str, b
         "winner": winner_code,
         "text": text,
         "scores": room.get("scores", {}),
+        "winning_score": room.get("winning_score", 400),
+        "winning_score": room.get("winning_score", 400),
         "last_trick_winner": room.get("last_trick_winner"),
         "bonus": bonus or {}
     })
@@ -880,7 +900,8 @@ async def _check_instant_win(room_id: str, room: dict) -> bool:
             scores[k] = 0
 
     max_score = max(scores.values()) if scores else 0
-    if max_score < WINNING_SCORE:
+    target_score = room_winning_score(room)
+    if max_score < target_score:
         return False
 
     winner_code, text = _evaluate_winner_after_round(room)
@@ -1366,9 +1387,11 @@ async def api_create_room(req: Request):
         "host": pn,
         "players": [{"name": pn, "identity": player_identity} if player_identity else {"name": pn}],
         "phase": "waiting",
+        "is_open": False,
         "deck": [],
         "melds": {pn: []},
         "scores": {pn: 0},
+        "winning_score": 400,
         "ready_to_start": False,
         "current_trick": [],
         "last_completed_trick": [],
@@ -1415,6 +1438,29 @@ async def api_create_room(req: Request):
     }
 
 
+@app.post("/api/open_room")
+async def api_open_room(req: Request):
+    b = await req.json()
+    rid = b.get("room_id")
+    player_name = _normalize_name(b.get("player_name"))
+
+    if not rid or rid not in ROOMS:
+        return JSONResponse({"error": "room_not_found"}, 404)
+
+    room = ROOMS[rid]
+
+    if room.get("host") != player_name:
+        return JSONResponse({"error": "host_only"}, 403)
+
+    room["winning_score"] = int(
+        b.get("winning_score", room.get("winning_score", DEFAULT_WINNING_SCORE))
+    )
+
+    room["is_open"] = True
+    await broadcast_lobby_rooms()
+
+    return {"opened": True, "room_id": rid}
+
 # ---------------------------------------------------
 # LIST ROOMS
 # ---------------------------------------------------
@@ -1426,11 +1472,18 @@ async def api_list_rooms():
         "players": 1
     }]
     for r in ROOMS.values():
-        if r.get("phase") == "waiting":
+        if r.get("phase") == "waiting" and r.get("is_open", False):
+            seated = len(r.get("players", []))
+            win_score = room_winning_score(r)
+            display_label = (
+                f"{r.get('host', 'Host')}'s Room, "
+                f"{win_score} Points, "
+                f"{seated}/4 Seated"
+            )
             rooms.append({
                 "room_id": r["room_id"],
-                "label": r["label"],
-                "players": len(r.get("players", []))
+                "label": display_label,
+                "players": seated
             })
     return {"rooms": rooms}
 
@@ -1457,6 +1510,7 @@ def _create_started_practice_room_for_player(pn: str, player_identity: str = "")
         "deck": [],
         "melds": {pn: [], "CPU 1": [], "CPU 2": [], "CPU 3": []},
         "scores": {pn: 0, "CPU 1": 0, "CPU 2": 0, "CPU 3": 0},
+        "winning_score": 400,
         "ready_to_start": True,
         "current_trick": [],
         "last_completed_trick": [],
@@ -2911,6 +2965,13 @@ async def api_start_cpu_game(req: Request):
         return JSONResponse({'error': 'bad_phase'}, 400)
 
     cpu_level = int(b.get('cpu_level', 2) or 2)
+    room['winning_score'] = int(b.get('winning_score', room.get('winning_score', DEFAULT_WINNING_SCORE)) or DEFAULT_WINNING_SCORE)
+
+    log.info(
+        f"[WIN SCORE START CPU] room={rid} "
+        f"stored={room.get('winning_score')} "
+        f"request={b.get('winning_score')}"
+    )
 
     result = await _start_cpu_style_game(rid, pn, cpu_level=cpu_level, cpu_scores_enabled=True)
     if isinstance(result, dict) and result.get("error"):
@@ -2927,6 +2988,13 @@ async def api_start_game(req: Request):
         return JSONResponse({"error": "room_not_found"}, 400)
 
     room = ROOMS[rid]
+    room["winning_score"] = int(b.get("winning_score", room.get("winning_score", DEFAULT_WINNING_SCORE)) or DEFAULT_WINNING_SCORE)
+
+    log.info(
+        f"[WIN SCORE START HUMAN] room={rid} "
+        f"stored={room.get('winning_score')} "
+        f"request={b.get('winning_score')}"
+    )
 
     if room.get("host") != pn:
         return JSONResponse({"error": "not_host"}, 403)
