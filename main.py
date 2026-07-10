@@ -1257,6 +1257,7 @@ async def broadcast_state_without_hands(room_id: str):
         "deck_count": int(deck_count),
         "melds": room.get("melds", {}),
         "scores": room.get("scores", {}),
+        "winning_score": room_winning_score(room),
         "room_label": room.get("label"),
         "current_turn": room.get("current_turn"),
         "lead": room.get("lead"),
@@ -1311,6 +1312,7 @@ async def send_state_update_to_player(room_id: str, player_name: str):
         "deck_count": int(deck_count),
         "melds": room.get("melds", {}),
         "scores": room.get("scores", {}),
+        "winning_score": room_winning_score(room),
         "room_label": room.get("label"),
         "current_turn": room.get("current_turn"),
         "lead": room.get("lead"),
@@ -1719,6 +1721,7 @@ async def api_reconnect_room(req: Request):
         "room_label": room.get("label", rid),
         "room_host": room.get("host", ""),
         "phase": room.get("phase", ""),
+        "winning_score": room_winning_score(room),
         "reconnect_token": token
     }
 
@@ -1773,6 +1776,7 @@ async def api_reconnect_by_identity(req: Request):
         "room_label": room.get("label", rid),
         "room_host": room.get("host", ""),
         "phase": room.get("phase", ""),
+        "winning_score": room_winning_score(room),
         "reconnect_token": token,
         "identity_reconnect": True
     }
