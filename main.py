@@ -40,6 +40,13 @@ app = FastAPI()
 async def root_health():
     return {"ok": True}
 
+# Basic ping endpoint used by the client before Leave Game.
+# This safely wakes sleeping Render instances without touching game state.
+@app.get("/api/ping")
+async def api_ping():
+    return {"ok": True}
+
+
 # ---------------------------------------------------
 # CORS
 # ---------------------------------------------------
