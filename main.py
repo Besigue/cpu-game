@@ -40,13 +40,6 @@ app = FastAPI()
 async def root_health():
     return {"ok": True}
 
-# Basic ping endpoint used by the client before Leave Game.
-# This safely wakes sleeping Render instances without touching game state.
-@app.get("/api/ping")
-async def api_ping():
-    return {"ok": True}
-
-
 # ---------------------------------------------------
 # CORS
 # ---------------------------------------------------
@@ -85,6 +78,32 @@ SUITS = ["hearts", "diamonds", "clubs", "spades"]
 
 MAX_SEATS = 4
 DEFAULT_WINNING_SCORE = 400
+
+# Stable room-table theme keys. These are data identifiers, not Wix element IDs.
+# New themes may be appended without changing existing keys.
+ROOM_TABLE_THEME_KEYS = {
+    "default",
+    "black",
+    "blue",
+    "burgundy",
+    "gold",
+    "green",
+    "purple",
+    "red",
+    "felt-black-casino",
+    "felt-blue",
+    "felt-blue-casino",
+    "felt-gold-casino",
+    "felt-green",
+    "felt-purple-casino",
+    "glass-clear",
+    "wood",
+    "wood-dark",
+}
+
+def normalize_room_table_theme_key(value):
+    key = str(value or "default").strip()
+    return key if key in ROOM_TABLE_THEME_KEYS else "default"
 
 def room_winning_score(room):
     try:
@@ -1265,6 +1284,7 @@ async def broadcast_state_without_hands(room_id: str):
         "melds": room.get("melds", {}),
         "scores": room.get("scores", {}),
         "winning_score": room_winning_score(room),
+        "room_table_theme_key": normalize_room_table_theme_key(room.get("room_table_theme_key")),
         "room_label": room.get("label"),
         "current_turn": room.get("current_turn"),
         "lead": room.get("lead"),
@@ -1320,6 +1340,7 @@ async def send_state_update_to_player(room_id: str, player_name: str):
         "melds": room.get("melds", {}),
         "scores": room.get("scores", {}),
         "winning_score": room_winning_score(room),
+        "room_table_theme_key": normalize_room_table_theme_key(room.get("room_table_theme_key")),
         "room_label": room.get("label"),
         "current_turn": room.get("current_turn"),
         "lead": room.get("lead"),
@@ -1397,6 +1418,7 @@ async def api_create_room(req: Request):
         "players": [{"name": pn, "identity": player_identity} if player_identity else {"name": pn}],
         "phase": "waiting",
         "is_open": False,
+        "room_table_theme_key": "default",
         "deck": [],
         "melds": {pn: []},
         "scores": {pn: 0},
@@ -1443,6 +1465,7 @@ async def api_create_room(req: Request):
         "room_label": room["label"],
         "player_name": pn,
         "room_host": room["host"],
+        "room_table_theme_key": normalize_room_table_theme_key(room.get("room_table_theme_key")),
         "reconnect_token": _ensure_reconnect_token(room, pn)
     }
 
@@ -1465,10 +1488,14 @@ async def api_open_room(req: Request):
         b.get("winning_score", room.get("winning_score", DEFAULT_WINNING_SCORE))
     )
 
+    room["room_table_theme_key"] = normalize_room_table_theme_key(
+        b.get("room_table_theme_key", room.get("room_table_theme_key", "default"))
+    )
+
     room["is_open"] = True
     await broadcast_lobby_rooms()
 
-    return {"opened": True, "room_id": rid}
+    return {"opened": True, "room_id": rid, "room_table_theme_key": room["room_table_theme_key"]}
 
 # ---------------------------------------------------
 # LIST ROOMS
@@ -1516,6 +1543,7 @@ def _create_started_practice_room_for_player(pn: str, player_identity: str = "")
             {"name": "CPU 3", "is_cpu": True, "controller": "cpu"},
         ],
         "phase": "lead_selection",
+        "room_table_theme_key": "default",
         "deck": [],
         "melds": {pn: [], "CPU 1": [], "CPU 2": [], "CPU 3": []},
         "scores": {pn: 0, "CPU 1": 0, "CPU 2": 0, "CPU 3": 0},
@@ -1585,6 +1613,7 @@ async def api_join_room(req: Request):
             "player_name": pn,
             "room_label": room["label"],
             "room_host": room["host"],
+            "room_table_theme_key": normalize_room_table_theme_key(room.get("room_table_theme_key")),
             "reconnect_token": _ensure_reconnect_token(room, pn)
         }
 
@@ -1654,6 +1683,7 @@ async def api_join_room(req: Request):
             "player_name": pn,
             "room_label": room["label"],
             "room_host": room["host"],
+            "room_table_theme_key": normalize_room_table_theme_key(room.get("room_table_theme_key")),
             "reconnect_token": _ensure_reconnect_token(room, pn)
         }
 
@@ -1677,6 +1707,7 @@ async def api_join_room(req: Request):
             "player_name": pn_req,
             "room_label": room["label"],
             "room_host": room["host"],
+            "room_table_theme_key": normalize_room_table_theme_key(room.get("room_table_theme_key")),
             "reconnect_token": _ensure_reconnect_token(room, pn_req)
         }
 
@@ -1686,6 +1717,7 @@ async def api_join_room(req: Request):
         "player_name": pn_req,
         "room_label": room["label"],
         "room_host": room["host"],
+        "room_table_theme_key": normalize_room_table_theme_key(room.get("room_table_theme_key")),
         "reconnect_token": _ensure_reconnect_token(room, pn_req)
     }
 
@@ -1729,6 +1761,7 @@ async def api_reconnect_room(req: Request):
         "room_host": room.get("host", ""),
         "phase": room.get("phase", ""),
         "winning_score": room_winning_score(room),
+        "room_table_theme_key": normalize_room_table_theme_key(room.get("room_table_theme_key")),
         "reconnect_token": token
     }
 
@@ -1784,6 +1817,7 @@ async def api_reconnect_by_identity(req: Request):
         "room_host": room.get("host", ""),
         "phase": room.get("phase", ""),
         "winning_score": room_winning_score(room),
+        "room_table_theme_key": normalize_room_table_theme_key(room.get("room_table_theme_key")),
         "reconnect_token": token,
         "identity_reconnect": True
     }
@@ -4210,6 +4244,8 @@ async def websocket_endpoint(
     player_name = _normalize_name(player_name)
 
     room.setdefault("players", [])
+    room.setdefault("room_table_theme_key", "default")
+    room["room_table_theme_key"] = normalize_room_table_theme_key(room.get("room_table_theme_key"))
     room.setdefault("scores", {})
     room.setdefault("melds", {})
     room.setdefault("scored_melds", {})
