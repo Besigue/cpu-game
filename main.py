@@ -3788,13 +3788,24 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
             await ws.send_json({"type": "info", "msg": "missing_uid"})
             return
 
-        valid = set()
-        for o in mp["options"]:
-            valid.add(o["king_code"])
-            valid.add(o["queen_code"])
+        # Validate the exact physical card selected against the server-created
+        # marriage option and the player's current hand/meld.
+        valid_uid_for_code = False
+        for o in mp.get("options", []):
+            if code == o.get("king_code") and uid == o.get("king_uid"):
+                valid_uid_for_code = True
+                break
+            if code == o.get("queen_code") and uid == o.get("queen_uid"):
+                valid_uid_for_code = True
+                break
 
-        if code not in valid:
+        if not valid_uid_for_code:
             await ws.send_json({"type": "info", "msg": "card_not_marriage_option"})
+            return
+
+        physical_cards = room.get("hands", {}).get(player, []) + room.get("melds", {}).get(player, [])
+        if not any(c.get("uid") == uid and c.get("code") == code for c in physical_cards):
+            await ws.send_json({"type": "info", "msg": "marriage_card_not_found"})
             return
 
         if code in mp["selected"]:
@@ -3870,11 +3881,24 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
         hand = room.get("hands", {}).get(player, [])
         meld = room.get("melds", {}).setdefault(player, [])
         uid_source = {}
+        cards_by_uid = {}
         for c in hand:
-            uid_source[c["uid"]] = "hand"
+            uid_source[c.get("uid")] = "hand"
+            cards_by_uid[c.get("uid")] = c
         for c in meld:
-            if c["uid"] not in uid_source:
-                uid_source[c["uid"]] = "meld"
+            if c.get("uid") not in uid_source:
+                uid_source[c.get("uid")] = "meld"
+                cards_by_uid[c.get("uid")] = c
+
+        # The two selected codes and UIDs must identify the same real K/Q cards.
+        if any(uid not in cards_by_uid or cards_by_uid[uid].get("code") != code
+               for uid, code in zip(uids, sel)):
+            await ws.send_json({"type": "info", "msg": "marriage_card_uid_code_mismatch"})
+            return
+        if any((cards_by_uid[uid].get("code", "").split("_of_")[0]
+                not in ("king", "queen")) for uid in uids):
+            await ws.send_json({"type": "info", "msg": "invalid_marriage_cards"})
+            return
 
         has_hand_kq = any(uid_source.get(uid) == "hand" for uid in uids)
         if not has_hand_kq:
@@ -3926,6 +3950,9 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
             "player": player,
             "suit": suit,
             "points": points,
+            "uids": list(uids),
+            "codes": list(sel),
+            "cards": [{"uid": uid, "code": code} for uid, code in zip(uids, sel)],
             "scores": room["scores"],
             "temp_melds": room["temp_melds"],
             "trump_suit": room.get("trump_suit"),
