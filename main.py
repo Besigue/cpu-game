@@ -1,5 +1,5 @@
 # ============================
-# main.py — Besigue Server (v82.4.10b-CPU-RUNNER-RESTART)
+# main.py — Besigue Server (v82.4.10c-LAST-TRICK-BONUS-FINALIZE)
 #
 # Based on your pasted v76.8 (NO rewrites / no new files).
 #
@@ -30,7 +30,7 @@ from itertools import combinations
 
 log = logging.getLogger("besigue")
 logging.basicConfig(level=logging.INFO)
-log.info("BOOT main.py v82.4.10b CPU_RUNNER_RESTART loaded")
+log.info("BOOT main.py v82.4.10c LAST_TRICK_BONUS_FINALIZE loaded")
 
 app = FastAPI()
 
@@ -832,7 +832,7 @@ def _format_winner_text(room: dict, winner: str) -> str:
     )
 
 
-def _evaluate_winner_after_round(room: dict) -> Tuple[str, str]:
+def _evaluate_winner_after_round(room: dict, apply_last_trick_tiebreak: bool = False) -> Tuple[str, str]:
     """
     ✅ Robust winner evaluation:
     - Coerce scores to int to prevent string compare edge cases.
@@ -865,8 +865,14 @@ def _evaluate_winner_after_round(room: dict) -> Tuple[str, str]:
         )
         return w, _format_winner_text(room, w)
 
+    # Besigue final-score tie-break: if the highest qualifying score is tied,
+    # the winner of the last trick wins the GAME outright, even if that
+    # player's own final score is below the tied highest score.
     last = room.get("last_trick_winner") or ""
-    if last and last in tied:
+    if apply_last_trick_tiebreak and last and last in scores:
+        log.info(
+            f"[WINNER TIEBREAK] last_trick_winner={last} tied_high_score={max_score}"
+        )
         return last, _format_winner_text(room, last)
 
     return "TIE", "Game is a TIE"
@@ -884,6 +890,7 @@ async def _end_game_now(room_id: str, room: dict, winner_code: str, text: str, b
     )
 
     room["phase"] = "game_over"
+    room["final_winner_text"] = text
     room["awaiting_next_round"] = False
     room["count_required"] = False
     room["count_done"] = False
@@ -1194,6 +1201,7 @@ async def start_next_round(room_id: str):
     room["draw_order"] = []
     room["draw_index"] = 0
     room["last_trick_winner"] = None
+    room["last_trick_bonus_awarded"] = False
     room["trump_suit"] = None
     room["meld_scored_this_trick"] = False
     room["phase3_melds_picked"] = False
@@ -1279,6 +1287,7 @@ async def broadcast_state_without_hands(room_id: str):
 
     data = {
         "phase": room.get("phase"),
+        "final_winner_text": room.get("final_winner_text", ""),
         "players": players,
         "deck_count": int(deck_count),
         "melds": room.get("melds", {}),
@@ -1335,6 +1344,7 @@ async def send_state_update_to_player(room_id: str, player_name: str):
 
     data = {
         "phase": room.get("phase"),
+        "final_winner_text": room.get("final_winner_text", ""),
         "players": players,
         "deck_count": int(deck_count),
         "melds": room.get("melds", {}),
@@ -1434,6 +1444,7 @@ async def api_create_room(req: Request):
         "draw_order": [],
         "draw_index": 0,
         "last_trick_winner": None,
+        "last_trick_bonus_awarded": False,
         "trump_suit": None,
         "scored_melds": {pn: []},
         "meld_scored_this_trick": False,
@@ -1559,6 +1570,7 @@ def _create_started_practice_room_for_player(pn: str, player_identity: str = "")
         "draw_order": [],
         "draw_index": 0,
         "last_trick_winner": None,
+        "last_trick_bonus_awarded": False,
         "trump_suit": None,
         "scored_melds": {pn: [], "CPU 1": [], "CPU 2": [], "CPU 3": []},
         "meld_scored_this_trick": False,
@@ -2958,6 +2970,7 @@ async def _start_cpu_style_game(room_id: str, host_name: str, cpu_level: int = 2
     room['draw_order'] = []
     room['draw_index'] = 0
     room['last_trick_winner'] = None
+    room['last_trick_bonus_awarded'] = False
     room['trump_suit'] = None
     room['temp_melds'] = {}
     room['scored_melds'] = {}
@@ -3080,6 +3093,7 @@ async def api_start_game(req: Request):
     room["draw_order"] = []
     room["draw_index"] = 0
     room["last_trick_winner"] = None
+    room["last_trick_bonus_awarded"] = False
     room["trump_suit"] = None
     room["temp_melds"] = {}
     room["scored_melds"] = {}
@@ -3193,7 +3207,7 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
 
             # ✅ IMPORTANT: if bonus pushed someone to 400+, end game AFTER the
             # score-any event has had a short lead.
-            winner_code, text = _evaluate_winner_after_round(room)
+            winner_code, text = _evaluate_winner_after_round(room, apply_last_trick_tiebreak=True)
             if winner_code and winner_code != "":
                 await asyncio.sleep(1.25)
                 await _end_game_now(room_id, room, winner_code, text, bonus=bonus)
@@ -3394,6 +3408,12 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
                         # Reuse the normal play_card pipeline (legality checks + broadcasts).
                         await process_action(_DUMMY_WS, room_id, nxtp, {"action": "play_card", "card": {"uid": uid2}})
 
+                # A nested automatic play may already have completed the final
+                # trick and moved the room to round_end_wait or game_over.
+                # Stop the outer automatic-play frames from finalizing it again.
+                if room.get("phase") != "phase3":
+                    return
+
             if len(room["current_trick"]) < 4:
                 await broadcast_state_without_hands(room_id)
                 return
@@ -3424,53 +3444,82 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
                     break
 
             if all_empty:
-                # Keep the final completed trick visible briefly before the round-end / winner UI appears.
-                # This covers both normal and auto-completed final tricks.
-                await asyncio.sleep(FINAL_TRICK_ROUND_END_DELAY_SAFE)
+                # Keep the four final-trick cards visible before starting the
+                # final-trick sound/bonus sequence. The client renders Phase 3
+                # trick cards through a paced render queue (up to ~1 second per
+                # card), so retain the existing pause and allow enough time for
+                # all four #playedCard slots to be painted.
+                final_cards_display_delay = max(
+                    float(FINAL_TRICK_ROUND_END_DELAY_SAFE or 0), 4.5
+                )
+                await asyncio.sleep(final_cards_display_delay)
 
-                winner_code, text = _evaluate_winner_after_round(room)
+                # Sound is a distinct event and MUST precede the score award.
+                # The client prioritizes this alert over queued card sounds.
+                if not room.get("last_trick_bonus_awarded", False):
+                    room["last_trick_bonus_awarded"] = True
+                    if winner:
+                        await _send_to_room(room_id, {
+                            "type": "last_trick_bonus_sound",
+                            "player": winner,
+                            "points": 10,
+                            "msg": f"Last trick won by {winner}. Ten-point bonus follows.",
+                            "trick_cards": _build_public_trick_payload(room),
+                        })
+                        # Give each connected browser time to start the alert
+                        # before any score is changed or winner UI is displayed.
+                        await asyncio.sleep(2.0)
 
-                if winner_code == "":
-                    room["awaiting_next_round"] = True
-                    room["phase"] = "round_end_wait"
-                    room["count_required"] = True
-                    room["count_done"] = False
-                    control_player = _sync_round_control_player(room_id, room)
+                        room.setdefault("scores", {})
+                        room["scores"][winner] = int(room["scores"].get(winner, 0) or 0) + 10
+                        await _send_to_room(room_id, {
+                            "type": "last_trick_bonus",
+                            "player": winner,
+                            "points": 10,
+                            "scores": dict(room.get("scores", {})),
+                            "msg": f"{winner} scores 10 points for winning the last trick!",
+                            "round": room.get("round_number"),
+                        })
 
-                    await _send_to_room(room_id, {
-                        "type": "round_end_wait",
-                        "msg": ("No winner yet. Count Aces and 10s." if control_player else "No winner yet. Waiting for a human player to reconnect."),
-                        "host": room.get("host"),
-                        "round_control_player": control_player,
-                    })
+                # The 10-point award can itself finish the game. Check it now,
+                # before enabling Count Aces & Tens or showing round controls.
+                winner_code, text = _evaluate_winner_after_round(room, apply_last_trick_tiebreak=True)
+                if winner_code:
+                    await _end_game_now(
+                        room_id,
+                        room,
+                        winner_code,
+                        text,
+                        bonus={"last_trick_bonus": 10},
+                    )
+                    return
 
-                    await _send_to_room(room_id, {
-                        "type": "show_winner",
-                        "winner": "",
-                        "text": NO_WINNER_TEXT,
-                        "scores": room.get("scores", {}),
-                        "last_trick_winner": room.get("last_trick_winner"),
-                        "bonus": {},
-                        "round_control_player": room.get("round_control_player", "")
-                    })
+                room["awaiting_next_round"] = True
+                room["phase"] = "round_end_wait"
+                room["count_required"] = True
+                room["count_done"] = False
+                control_player = _sync_round_control_player(room_id, room)
 
-                    await broadcast_state_without_hands(room_id)
-                    for p in order:
-                        await send_state_update_to_player(room_id, p)
+                await _send_to_room(room_id, {
+                    "type": "round_end_wait",
+                    "msg": ("No winner yet. Count Aces and 10s." if control_player else "No winner yet. Waiting for a human player to reconnect."),
+                    "host": room.get("host"),
+                    "round_control_player": control_player,
+                })
 
-                else:
-                    room["phase"] = "game_over"
-                    await asyncio.sleep(POST_SCORE_SHOWWINNER_DELAY)
-                    await _send_to_room(room_id, {
-                        "type": "show_winner",
-                        "winner": winner_code,
-                        "text": text,
-                        "scores": room.get("scores", {}),
-                        "last_trick_winner": room.get("last_trick_winner"),
-                        "bonus": {}
-                    })
-                    await _send_to_room(room_id, {"type": "game_over", "msg": "Game Over"})
-                    await broadcast_state_without_hands(room_id)
+                await _send_to_room(room_id, {
+                    "type": "show_winner",
+                    "winner": "",
+                    "text": NO_WINNER_TEXT,
+                    "scores": room.get("scores", {}),
+                    "last_trick_winner": room.get("last_trick_winner"),
+                    "bonus": {},
+                    "round_control_player": room.get("round_control_player", "")
+                })
+
+                await broadcast_state_without_hands(room_id)
+                for p in order:
+                    await send_state_update_to_player(room_id, p)
 
             return
 
