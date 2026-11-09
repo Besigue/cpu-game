@@ -955,19 +955,34 @@ async def _check_instant_win(room_id: str, room: dict) -> bool:
 
 
 async def _award_trump_seven_if_applicable(room_id: str, room: dict, player: str, card_code: str) -> bool:
-    """Award +10 immediately when a player legally plays the 7 of trump.
+    """Award +10 immediately when a player legally plays the 7 of trump in GP2.
 
-    Returns True if this scoring event ended the game.
-    This is intentionally server-authoritative and runs after the card has already
-    passed normal play legality and has been added to current_trick.
+    Parse the card and trump suit directly instead of depending on the rank
+    helper's numeric mapping. The bonus is deliberately disabled in GP3.
+    Returns True if the award ended the game.
     """
     try:
-        trump = (room.get("trump_suit") or "").strip().lower()
-        if not trump or not card_code or str(card_code).startswith("joker"):
+        # The trump-seven bonus applies in GP2 only. In particular, playing
+        # the 7 of trump during GP3 must never award these 10 points.
+        if str(room.get("phase") or "").strip().lower() != "phase2":
             return False
-        if rank_of(card_code) != rank_value_map.get("7"):
+
+        code = str(card_code or "").strip().lower()
+        trump = str(room.get("trump_suit") or "").strip().lower()
+        if not code or code.startswith("joker") or "_of_" not in code or not trump:
             return False
-        if (suit_of(card_code) or "").strip().lower() != trump:
+
+        rank_token, suit_token = code.split("_of_", 1)
+        suit_aliases = {
+            "heart": "hearts", "hearts": "hearts", "♥": "hearts",
+            "diamond": "diamonds", "diamonds": "diamonds", "♦": "diamonds",
+            "club": "clubs", "clubs": "clubs", "♣": "clubs",
+            "spade": "spades", "spades": "spades", "♠": "spades",
+        }
+        normalized_card_suit = suit_aliases.get(suit_token.strip(), suit_token.strip())
+        normalized_trump = suit_aliases.get(trump, trump)
+
+        if rank_token != "7" or normalized_card_suit != normalized_trump:
             return False
 
         room.setdefault("scores", {})
@@ -977,30 +992,41 @@ async def _award_trump_seven_if_applicable(room_id: str, room: dict, player: str
             before = 0
         room["scores"][player] = before + 10
 
-        log.info(f"[TRUMP SEVEN SCORE] room={room_id} player={player} card={card_code} trump={trump} +10 score={room['scores'].get(player)}")
+        log.info(
+            f"[TRUMP SEVEN SCORE] room={room_id} phase={room.get('phase')} "
+            f"player={player} card={code} trump={normalized_trump} "
+            f"+10 score={room['scores'].get(player)}"
+        )
 
         # Give every browser time to show the trump 7 and hear the alert before
         # another CPU-controlled player immediately covers the next trick slot.
-        # Human turns are not delayed; the CPU runner checks this timestamp before
-        # continuing automated play.
         room["_pause_after_trump_seven_until"] = time.monotonic() + 2.0
 
         await _send_to_room(room_id, {
             "type": "trump_seven_scored",
             "player": player,
-            "card": card_code,
+            "card": code,
             "points": 10,
             "scores": room.get("scores", {}),
             "play_turn_alert": True,
             "msg": f"{player} scored 10 points for playing the 7 of trump."
         })
 
+        # Push the authoritative updated score state as well as the scoring
+        # event, so every browser's score markers remain synchronized in GP3.
+        await broadcast_state_without_hands(room_id)
+        for player_name in _players_order(room):
+            await send_state_update_to_player(room_id, player_name)
+
         # If this immediate bonus reaches the winning score, let the scoring/alert
         # sound happen first; _end_game_now already includes a short delay before
         # show_winner / game_over.
         return await _check_instant_win(room_id, room)
     except Exception as e:
-        log.exception(f"[TRUMP SEVEN SCORE ERROR] room={room_id} player={player} card={card_code} err={e}")
+        log.exception(
+            f"[TRUMP SEVEN SCORE ERROR] room={room_id} player={player} "
+            f"card={card_code} err={e}"
+        )
         return False
 
 
