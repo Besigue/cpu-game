@@ -1,5 +1,5 @@
 # ============================
-# main.py — Besigue Server (v82.4.10c-LAST-TRICK-BONUS-FINALIZE)
+# main.py — Besigue Server (v82.4.10d-MARRIAGE-UID-OPTIONS-FIX)
 #
 # Based on your pasted v76.8 (NO rewrites / no new files).
 #
@@ -30,7 +30,7 @@ from itertools import combinations
 
 log = logging.getLogger("besigue")
 logging.basicConfig(level=logging.INFO)
-log.info("BOOT main.py v82.4.10c LAST_TRICK_BONUS_FINALIZE loaded")
+log.info("BOOT main.py v82.4.10d MARRIAGE_UID_OPTIONS_FIX loaded")
 
 app = FastAPI()
 
@@ -3688,14 +3688,19 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
                 if not valid_pairs:
                     continue
 
-                k, q = valid_pairs[0]
-                options.append({
-                    "suit": suit_name,
-                    "king_uid": k["uid"],
-                    "queen_uid": q["uid"],
-                    "king_code": k["code"],
-                    "queen_code": q["code"]
-                })
+                # Keep EVERY eligible physical K/Q pair for this suit.
+                # Multiple decks contain duplicate card codes with different UIDs;
+                # restricting this to valid_pairs[0] made other physically valid
+                # King/Queen cards appear selectable in the browser but fail the
+                # exact-UID validation in start_marriage.
+                for k, q in valid_pairs:
+                    options.append({
+                        "suit": suit_name,
+                        "king_uid": k["uid"],
+                        "queen_uid": q["uid"],
+                        "king_code": k["code"],
+                        "queen_code": q["code"]
+                    })
 
         if options:
             room["marriage_pending"] = {
@@ -3852,6 +3857,7 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
     if action == "start_marriage":
         mp = room.get("marriage_pending")
         if not mp or mp["player"] != player:
+            await send_state_update_to_player(room_id, player)
             await ws.send_json({"type": "info", "msg": "no_marriage_pending"})
             return
 
@@ -3860,6 +3866,7 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
         uid = card.get("uid")
 
         if not uid:
+            await send_state_update_to_player(room_id, player)
             await ws.send_json({"type": "info", "msg": "missing_uid"})
             return
 
@@ -3875,19 +3882,23 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
                 break
 
         if not valid_uid_for_code:
+            await send_state_update_to_player(room_id, player)
             await ws.send_json({"type": "info", "msg": "card_not_marriage_option"})
             return
 
         physical_cards = room.get("hands", {}).get(player, []) + room.get("melds", {}).get(player, [])
         if not any(c.get("uid") == uid and c.get("code") == code for c in physical_cards):
+            await send_state_update_to_player(room_id, player)
             await ws.send_json({"type": "info", "msg": "marriage_card_not_found"})
             return
 
         if code in mp["selected"]:
+            await send_state_update_to_player(room_id, player)
             await ws.send_json({"type": "info", "msg": "already_selected"})
             return
 
         if len(mp["selected"]) >= 2:
+            await send_state_update_to_player(room_id, player)
             await ws.send_json({"type": "info", "msg": "too_many_selected"})
             return
 
@@ -3921,10 +3932,12 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
 
         mp = room.get("marriage_pending")
         if not mp or mp["player"] != player:
+            await send_state_update_to_player(room_id, player)
             await ws.send_json({"type": "info", "msg": "no_marriage_pending"})
             return
 
         if len(mp["selected"]) != 2:
+            await send_state_update_to_player(room_id, player)
             await ws.send_json({"type": "info", "msg": "need_two_cards"})
             return
 
@@ -3932,6 +3945,7 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
         uids = mp["selected_uids"]
 
         if len(uids) != 2 or (not uids[0]) or (not uids[1]) or (uids[0] == uids[1]):
+            await send_state_update_to_player(room_id, player)
             await ws.send_json({"type": "info", "msg": "missing_or_duplicate_uid"})
             return
 
@@ -3943,12 +3957,14 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
                 for u in rec.get("uids", []):
                     used_in_marriage.add(u)
         if any(u in used_in_marriage for u in uids):
+            await send_state_update_to_player(room_id, player)
             await ws.send_json({"type": "info", "msg": "marriage_uid_already_used"})
             return
 
         suit_a = sel[0].split("_of_")[1] if sel[0] and "_of_" in sel[0] else None
         suit_b = sel[1].split("_of_")[1] if sel[1] and "_of_" in sel[1] else None
         if not suit_a or not suit_b or suit_a != suit_b:
+            await send_state_update_to_player(room_id, player)
             await ws.send_json({"type": "info", "msg": "invalid_suit"})
             return
         suit = suit_a
@@ -3968,15 +3984,18 @@ async def process_action(ws: WebSocket, room_id: str, player_name: str, msg: dic
         # The two selected codes and UIDs must identify the same real K/Q cards.
         if any(uid not in cards_by_uid or cards_by_uid[uid].get("code") != code
                for uid, code in zip(uids, sel)):
+            await send_state_update_to_player(room_id, player)
             await ws.send_json({"type": "info", "msg": "marriage_card_uid_code_mismatch"})
             return
         if any((cards_by_uid[uid].get("code", "").split("_of_")[0]
                 not in ("king", "queen")) for uid in uids):
+            await send_state_update_to_player(room_id, player)
             await ws.send_json({"type": "info", "msg": "invalid_marriage_cards"})
             return
 
         has_hand_kq = any(uid_source.get(uid) == "hand" for uid in uids)
         if not has_hand_kq:
+            await send_state_update_to_player(room_id, player)
             await ws.send_json({"type": "info", "msg": "marriage_requires_hand_card"})
             return
 
